@@ -108,6 +108,9 @@ operator trace rather than treating the event number as pure kernel time.
 
 - Optional schedule cache (`--cache-schedule` in replay), disabled in deployment defaults.
   It avoids repeated schedule allocation, grid validation and device-to-host scan construction.
+  Cache misses compute normalized sigmas on the same device as the reference path, then retain
+  those tensors. They do not substitute CPU division for GPU division. This preserves reference
+  rounding; the first cache fill still incurs the reference validation/copy overhead.
 - Transactional sampler failure: histories, request counter and both RNG streams roll back.
 - Replay records stage batch sizes, peak allocated/reserved memory, free CUDA memory,
   torch/device metadata, input hash and implementation identity.
@@ -116,6 +119,8 @@ operator trace rather than treating the event number as pure kernel time.
 - CPU tests compare 64 requests, resets, changed prompts/prefixes, and failed-request retry.
 
 No GPU speedup is claimed: the execution sandbox cannot initialize host CUDA.
+Cached trajectory failures additionally save `cache_parity_failure.json` with action/video errors
+and a bitwise normalized-sigma comparison. These failures remain fatal even in diagnostic mode.
 Existing running evaluators are not modified or restarted; new source hashes may invalidate
 resume against old manifests. Keep old experiment outputs separate.
 

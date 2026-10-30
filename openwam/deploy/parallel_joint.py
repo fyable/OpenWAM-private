@@ -142,8 +142,7 @@ class JointParaFlowSampler:
                         float(architecture.action_scheduler.num_train_timesteps))
         cached = self._schedule_cache.get(schedule_key) if self.cache_schedule else None
         if cached is None:
-            grid = torch.tensor(schedule, dtype=torch.float32,
-                                device="cpu" if self.cache_schedule else videos.device)
+            grid = torch.tensor(schedule, dtype=torch.float32, device=videos.device)
             video_grid = grid[:, 0] / schedule_key[2]
             action_grid = grid[:, 1] / schedule_key[3]
             if not all(torch.isfinite(value).all() and (value[:-1] > value[1:]).all()

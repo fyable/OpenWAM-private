@@ -102,6 +102,20 @@ def test_cached_schedule_matches_default_over_resets():
     assert len(cached._schedule_cache) == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_cached_schedule_cuda_matches_reference_exactly():
+    architecture = FakeArchitecture()
+    reference, cached = JointParaFlowSampler(), JointParaFlowSampler(cache_schedule=True)
+    schedule = [(1000.0, 1000.0), (937.5, 917.0), (832.0, 713.0), (557.0, 327.0), (0.0, 0.0)]
+    for index in range(32):
+        values = {key: value.cuda() for key, value in inputs(float(index)).items()}
+        results = [sampler.sample(architecture, values, torch.ones(1, 32, 80, device="cuda"),
+                                  schedule, None, prompt="task", seed=42)
+                   for sampler in (reference, cached)]
+        for actual, expected in zip(*results):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_two_phase_bootstrap_then_single_call(core):
     sampler = JointParaFlowSampler()
     architecture = FakeArchitecture()

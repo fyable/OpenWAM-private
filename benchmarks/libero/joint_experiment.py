@@ -77,6 +77,18 @@ def hardware_snapshot():
     return results
 
 
+def require_exclusive_device(device):
+    import torch
+
+    uuid = str(torch.cuda.get_device_properties(device).uuid).removeprefix("GPU-")
+    result = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
+                            capture_output=True, text=True, timeout=10, check=True)
+    foreign = [line for line in result.stdout.splitlines() if line.split(",")[0].strip().removeprefix("GPU-") == uuid
+               and int(line.split(",")[1]) != os.getpid()]
+    if foreign:
+        raise RuntimeError(f"Exclusive GPU timing rejected: {foreign}")
+
+
 @contextmanager
 def scoped_annotations(architecture):
     import torch
@@ -263,6 +275,8 @@ def replay(args):
     selected = selected_indices(observations, args.warmup, args.measure)
     chosen = set(selected)
     engine, checkpoint = build_engine(args)
+    if args.require_exclusive:
+        require_exclusive_device(args.device)
     hardware_before = hardware_snapshot()
     conditions = [{"first_frame_image": [Image.fromarray(image)], "prompt": str(prompt),
                    "proprio": state, "seed": 42}
@@ -325,6 +339,8 @@ def replay(args):
     try:
         with (args.output / "requests.jsonl").open("x") as log:
             for index in range(selected[-1] + 1):
+                if args.require_exclusive and index % 10 == 0:
+                    require_exclusive_device(args.device)
                 reset = bool(observations[3][index]) or conditions[index]["prompt"] != previous_prompt
                 order = method_order(index)
                 for position, name in enumerate(order):
@@ -365,10 +381,28 @@ def replay(args):
                     log.flush()
                 base, cached = states["joint_n4"]["sampler"], states["joint_cached_n4"]["sampler"]
                 errors = []
-                for actual, expected in [(cached.history, base.history),
-                                         *[(cached.video_phases[key], base.video_phases[key]) for key in base.video_phases]]:
-                    torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.05)
-                    errors.append(float((actual - expected).abs().max()))
+                diagnostics = {}
+                for label, actual, expected in [("action_history", cached.history, base.history),
+                                                *[(f"video_phase_{key}", cached.video_phases[key], base.video_phases[key])
+                                                  for key in base.video_phases]]:
+                    diagnostic = tensor_error(actual, expected)
+                    diagnostics[label] = diagnostic
+                    if diagnostic["finite"]:
+                        errors.append(diagnostic["max_absolute_error"])
+                if not all(value["passed"] for value in diagnostics.values()):
+                    schedule_grid = torch.tensor(base.signature[2], device=base.history.device, dtype=torch.float32)
+                    expected_sigmas = (
+                        schedule_grid[:, 0] / float(engine.architecture.video_scheduler.num_train_timesteps),
+                        schedule_grid[:, 1] / float(engine.architecture.action_scheduler.num_train_timesteps),
+                    )
+                    cached_sigmas = next(iter(cached._schedule_cache.values()))[:2]
+                    write_json(args.output / "cache_parity_failure.json",
+                               {"status": "failed", "index": index, "rtol": 0.05, "atol": 0.05,
+                                "trajectories": diagnostics,
+                                "schedule_sigmas_equal": all(torch.equal(left, right)
+                                                             for left, right in zip(cached_sigmas, expected_sigmas))})
+                    raise RuntimeError("Cached trajectory parity failed; see cache_parity_failure.json. "
+                                       "No thresholds were relaxed.")
                 partition_rows.append({"index": index, "max_absolute_error": max(errors)})
                 previous_prompt = conditions[index]["prompt"]
                 if index % 10 == 0 or index == selected[-1]:
@@ -392,6 +426,8 @@ def replay(args):
         paired[name] = {"native_n10_speedup": percentiles([base / value for base, value in zip(baseline, values)]),
                         "native_n10_minus_method_ms": percentiles([base - value for base, value in zip(baseline, values)])}
     properties = torch.cuda.get_device_properties(args.device)
+    if args.require_exclusive:
+        require_exclusive_device(args.device)
     report = {"status": "completed", "measurement_status": "complete", "timing_valid": True,
               "numerical_equivalence_validated": parity["status"] == "passed",
               "interpretation": "validated_comparison" if parity["status"] == "passed" else "performance_diagnostic_only_parity_failed",
@@ -563,6 +599,7 @@ def parser():
     result.add_argument("--skip-profile", action="store_true")
     result.add_argument("--allow-parity-failure", action="store_true",
                         help="Explicitly continue finite batch mismatches for labeled performance diagnostics only")
+    result.add_argument("--require-exclusive", action="store_true")
     return result
 
 
@@ -638,6 +675,8 @@ def run_worker(args, mode):
     command.extend(["--micro-warmup", str(args.micro_warmup), "--micro-measure", str(args.micro_measure)])
     if args.allow_parity_failure:
         command.append("--allow-parity-failure")
+    if args.require_exclusive:
+        command.append("--require-exclusive")
     if args.ckpt_name:
         command.extend(["--ckpt-name", args.ckpt_name])
     registry = ProcessRegistry()
