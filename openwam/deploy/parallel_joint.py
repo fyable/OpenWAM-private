@@ -6,6 +6,7 @@ import hashlib
 import logging
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -21,9 +22,11 @@ def load_core():
 
 
 def core_identity():
+    from openwam.deploy import joint_conditions, joint_execution
+
     return {
         str(Path(module.__file__).resolve()): hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
-        for module in (*load_core(), sys.modules[__name__])
+        for module in (*load_core(), sys.modules[__name__], joint_conditions, joint_execution)
     }
 
 
@@ -62,14 +65,33 @@ def joint_velocity(architecture, inputs, videos, actions, timesteps):
 
 
 class JointParaFlowSampler:
-    """Two video-phase bootstraps, then one batched joint traversal per call."""
+    """Serial initialization, then one batched joint traversal per request."""
 
-    def __init__(self, advance=8, *, cache_schedule=False):
+    def __init__(self, advance=8, *, cache_schedule=False, share_conditions=False,
+                 history_scope="phase_video_action", action_tail_init="stage_residual",
+                 video_tail_init="stage_residual", execution_backend="legacy", execution_profile=False,
+                 allow_execution_parity_failure=False):
+        if execution_backend not in ("legacy", "prepared", "prefix"):
+            raise ValueError(f"Unknown Joint execution backend: {execution_backend}")
+        if execution_backend != "legacy" and share_conditions:
+            raise ValueError("Explicit prepared execution cannot use legacy forward sharing")
+        self.execution_backend = execution_backend
+        self.execution_profile = execution_profile
+        self.allow_execution_parity_failure = allow_execution_parity_failure
+        self.validate_execution = True
         if advance != 8:
             raise ValueError("joint-paraflow v1 requires inference_horizon=8")
+        if history_scope not in ("phase_video_action", "action_only"):
+            raise ValueError(f"Unknown joint history scope: {history_scope}")
+        if any(value not in ("stage_residual", "endpoint_bridge") for value in (action_tail_init, video_tail_init)):
+            raise ValueError("Unknown joint tail initialization")
         self.alignment, self.scan_core, self.video_core = load_core()
         self.advance = advance
         self.cache_schedule = cache_schedule
+        self.share_conditions = share_conditions
+        self.history_scope = history_scope
+        self.action_tail_init = action_tail_init
+        self.video_tail_init = video_tail_init
         self.identity = core_identity()
         self.reset()
 
@@ -82,6 +104,7 @@ class JointParaFlowSampler:
         self.video_generator = None
         self.last_stats = None
         self._schedule_cache = {}
+        self.execution_validation = {}
 
     def _constrain(self, videos, actions, ref, sigmas, noise, inactive):
         videos = videos.float().clone()
@@ -99,11 +122,29 @@ class JointParaFlowSampler:
         snapshot = dict(self.__dict__)
         snapshot["video_phases"] = dict(self.video_phases)
         snapshot["_schedule_cache"] = dict(self._schedule_cache)
+        snapshot["execution_validation"] = dict(self.execution_validation)
         generators = [(generator, generator.get_state()) for generator in
                       (self.action_generator, self.video_generator) if generator is not None]
         try:
-            return self._sample(architecture, inputs, action_noise, schedule, inactive,
-                                prompt=prompt, seed=seed)
+            from openwam.deploy.joint_conditions import shared_stage_conditions
+
+            scope = shared_stage_conditions(architecture) if self.share_conditions else nullcontext(None)
+            with scope as stats:
+                executor = None
+                if self.execution_backend != "legacy":
+                    from openwam.deploy.joint_execution import JointRequestExecutor
+
+                    executor = JointRequestExecutor(architecture, inputs, self.execution_backend, profile=self.execution_profile)
+                result = self._sample(architecture, inputs, action_noise, schedule, inactive,
+                                      prompt=prompt, seed=seed, executor=executor)
+                if executor is not None:
+                    self.last_stats["execution"] = executor.report()
+                    self.last_stats["execution_validation"] = dict(self.execution_validation)
+                    self.last_stats["interpretation"] = ("diagnostic_only" if any(not row["passed"] for row in self.execution_validation.values())
+                                                         else "execution_checks_passed" if self.execution_validation else "validation_not_run")
+                if stats is not None:
+                    self.last_stats["condition_sharing"] = dict(stats)
+                return result
         except Exception:
             self.__dict__.clear()
             self.__dict__.update(snapshot)
@@ -111,7 +152,32 @@ class JointParaFlowSampler:
                 generator.set_state(state)
             raise
 
-    def _sample(self, architecture, inputs, action_noise, schedule, inactive, *, prompt, seed):
+    def _velocity(self, architecture, inputs, videos, actions, schedule, executor):
+        if executor is None:
+            return joint_velocity(architecture, inputs, videos, actions, schedule)
+        result = executor.velocity(videos, actions, schedule)
+        key = str((tuple(map(tuple, schedule)), tuple(videos.shape), tuple(actions.shape), str(actions.dtype), str(actions.device)))
+        if self.validate_execution and key not in self.execution_validation:
+            from openwam.deploy.joint_execution import prediction_errors
+
+            expected = joint_velocity(architecture, inputs, videos, actions, schedule)
+            diagnostic = prediction_errors(result, expected)
+            if len(actions) > 1:
+                independent = [joint_velocity(architecture, inputs, videos[index:index + 1], actions[index:index + 1],
+                                               [schedule[index]]) for index in range(len(actions))]
+                diagnostic["partition"] = prediction_errors(expected, tuple(torch.cat([row[modality] for row in independent])
+                                                                            for modality in (0, 1)))
+                diagnostic["passed"] &= diagnostic["partition"]["passed"]
+                diagnostic["finite"] &= diagnostic["partition"]["finite"]
+            self.execution_validation[key] = diagnostic
+            logger.info("Joint execution validation=%s", diagnostic)
+            if not diagnostic["finite"] or (not diagnostic["passed"] and not self.allow_execution_parity_failure):
+                error = RuntimeError("Joint execution/partition parity failed; thresholds unchanged; see validation log")
+                error.execution_diagnostic = {"key": key, "checks": diagnostic}
+                raise error
+        return result
+
+    def _sample(self, architecture, inputs, action_noise, schedule, inactive, *, prompt, seed, executor=None):
         videos = inputs["latents"]
         ref = inputs.get("first_frame_latents")
         if videos.ndim != 5 or videos.shape[0] != 1 or videos.shape[2] != 3:
@@ -125,7 +191,8 @@ class JointParaFlowSampler:
             raise ValueError("joint-paraflow requires at least two stages and a zero endpoint")
         signature = (prompt, seed, schedule, tuple(videos.shape), tuple(action_noise.shape),
                      str(videos.device), str(architecture.dtype),
-                     None if inactive is None else tuple(inactive.tolist()))
+                     None if inactive is None else tuple(inactive.tolist()), self.history_scope,
+                     self.action_tail_init, self.video_tail_init)
         reset_reason = None
         if self.signature != signature:
             reset_reason = "initial" if self.signature is None else "condition_signature_changed"
@@ -154,8 +221,9 @@ class JointParaFlowSampler:
                 self._schedule_cache[schedule_key] = cached
         video_sigmas, action_sigmas, scan = cached
         plan = self.video_core.VideoPhasePlan(32, 2, self.advance)
-        phase = self.request % plan.phases
-        cold = phase not in self.video_phases
+        use_video_history = self.history_scope == "phase_video_action"
+        phase = self.request % plan.phases if use_video_history else 0
+        cold = phase not in self.video_phases if use_video_history else self.history is None
         fresh_actions = torch.randn(action_noise.shape, device=action_noise.device,
                                     dtype=action_noise.dtype, generator=self.action_generator)
         if self.request:
@@ -170,8 +238,8 @@ class JointParaFlowSampler:
                 action_noise = self.alignment.couple_noise(self.history[0], action_noise, self.advance, 32)
             video_nodes, action_nodes = [videos.float()], [action_noise.float()]
             for index, pair in enumerate(schedule[:-1]):
-                velocity_video, velocity_action = joint_velocity(
-                    architecture, inputs, video_nodes[-1], action_nodes[-1], [pair]
+                velocity_video, velocity_action = self._velocity(
+                    architecture, inputs, video_nodes[-1], action_nodes[-1], [pair], executor
                 )
                 calls += 1
                 next_video = video_nodes[-1] + velocity_video.float() * (video_sigmas[index + 1] - video_sigmas[index])
@@ -188,35 +256,46 @@ class JointParaFlowSampler:
                 action_nodes.append(constrained_action[0])
             video_nodes, action_nodes = torch.stack(video_nodes), torch.stack(action_nodes)
         else:
-            video_nodes = self.video_core.align_video_trajectory(
-                self.video_phases[phase], videos, video_sigmas, plan.shift_latents, ref
-            )
+            if use_video_history:
+                video_nodes = self.video_core.align_video_trajectory(
+                    self.video_phases[phase], videos, video_sigmas, plan.shift_latents, ref,
+                    tail_state_init=self.video_tail_init,
+                )
+            else:
+                video_nodes = self.video_core.current_video_candidates(videos, ref, video_sigmas)
             action_nodes = self.alignment.align_trajectory(
-                self.history, action_noise, action_sigmas, self.advance, 32
+                self.history, action_noise, action_sigmas, self.advance, 32, tail_state_init=self.action_tail_init,
             )
             video_nodes, action_nodes = self._constrain(
                 video_nodes, action_nodes, ref, action_sigmas, action_nodes[0], inactive
             )
-            velocity_video, velocity_action = joint_velocity(
-                architecture, inputs, video_nodes[:-1, 0], action_nodes[:-1, 0], schedule[:-1]
+            velocity_video, velocity_action = self._velocity(
+                architecture, inputs, video_nodes[:-1, 0], action_nodes[:-1, 0], schedule[:-1], executor
             )
             calls += 1
-            video_nodes = self.scan_core.euler_prefix(video_nodes[0], velocity_video[:, None], sigmas=video_sigmas)
-            action_nodes = scan(action_nodes, velocity_action[:, None], velocity_sign=-1)
-        video_nodes, action_nodes = self._constrain(
-            video_nodes, action_nodes, ref, action_sigmas, action_nodes[0], inactive
-        )
+            with executor.region("trajectory_update") if executor is not None else nullcontext():
+                video_nodes = self.scan_core.euler_prefix(video_nodes[0], velocity_video[:, None], sigmas=video_sigmas)
+                action_nodes = scan(action_nodes, velocity_action[:, None], velocity_sign=-1)
+        with executor.region("trajectory_constraints") if executor is not None else nullcontext():
+            video_nodes, action_nodes = self._constrain(
+                video_nodes, action_nodes, ref, action_sigmas, action_nodes[0], inactive
+            )
         self.history = action_nodes.detach()
-        self.video_phases[phase] = video_nodes.detach()
+        if use_video_history:
+            self.video_phases[phase] = video_nodes.detach()
         self.request += 1
         if videos.is_cuda:
             torch.cuda.synchronize(videos.device)
         self.last_stats = {
-            "sampler": "joint-paraflow", "algorithm": "phase-euler-v1-native-adapter",
-            "cold": cold, "phase": phase, "phases": plan.phases, "reset_reason": reset_reason,
+            "sampler": "joint-paraflow",
+            "algorithm": "phase-euler-v1-native-adapter" if use_video_history else "action-only-current-video-v1",
+            "history_scope": self.history_scope,
+            "action_tail_init": self.action_tail_init, "video_tail_init": self.video_tail_init,
+            "cold": cold, "phase": phase, "phases": plan.phases if use_video_history else 1,
+            "reset_reason": reset_reason,
             "joint_forward_calls": calls, "stage_batch": 1 if cold else len(schedule) - 1,
-            "action_advance": self.advance, "video_shift_latents": plan.shift_latents,
-            "video_history_age_actions": 0 if cold else plan.phases * self.advance,
+            "action_advance": self.advance, "video_shift_latents": plan.shift_latents if use_video_history else 0,
+            "video_history_age_actions": plan.phases * self.advance if use_video_history and not cold else 0,
             "denoise_ms": 1000 * (time.perf_counter() - start),
             "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(videos.device) if videos.is_cuda else None,
         }

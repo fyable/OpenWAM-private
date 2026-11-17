@@ -233,3 +233,4 @@ migration-export/
 *.pem
 *.key
 third_party/cosmos-predict2.5/
+/experiment/

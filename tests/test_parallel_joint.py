@@ -62,9 +62,11 @@ def test_batch_velocity_matches_independent_calls():
     assert architecture.batches == [4, 1, 1, 1, 1]
 
 
-def test_failure_rolls_back_rng_and_history():
-    sampler = JointParaFlowSampler(cache_schedule=True)
-    reference = JointParaFlowSampler(cache_schedule=True)
+@pytest.mark.parametrize("scope", ["phase_video_action", "action_only"])
+@pytest.mark.parametrize("tail", ["stage_residual", "endpoint_bridge"])
+def test_failure_rolls_back_rng_and_history(scope, tail):
+    sampler = JointParaFlowSampler(cache_schedule=True, history_scope=scope, action_tail_init=tail, video_tail_init=tail)
+    reference = JointParaFlowSampler(cache_schedule=True, history_scope=scope, action_tail_init=tail, video_tail_init=tail)
     architecture = FakeArchitecture()
     for _ in range(3):
         sample(sampler, architecture)
@@ -85,6 +87,96 @@ def test_failure_rolls_back_rng_and_history():
     expected = sample(reference, architecture)
     for value, target in zip(actual, expected):
         torch.testing.assert_close(value, target, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("stages", [4, 10])
+def test_action_history_one_bootstrap_and_single_warm_forward(stages):
+    sampler = JointParaFlowSampler(history_scope="action_only", cache_schedule=True)
+    reference = JointParaFlowSampler(history_scope="action_only")
+    architecture = FakeArchitecture()
+    schedule = [(float(time), float(time)) for time in torch.linspace(1000, 0, stages + 1)]
+    for index in range(6):
+        before = len(architecture.batches)
+        video, action = sample(sampler, architecture, prefix=float(index), schedule=schedule)
+        calls = architecture.batches[before:]
+        assert calls == ([1] * stages if index == 0 else [stages])
+        assert sampler.last_stats["cold"] is (index == 0)
+        assert sampler.last_stats["joint_forward_calls"] == (stages if index == 0 else 1)
+        assert sampler.last_stats["video_history_age_actions"] == 0
+        assert sampler.last_stats["history_scope"] == "action_only"
+        assert not sampler.video_phases
+        assert video.shape == (1, 2, 3, 2, 2)
+        torch.testing.assert_close(video[:, :, :1], torch.full_like(video[:, :, :1], float(index)))
+        torch.testing.assert_close(action[..., 10:], torch.zeros_like(action[..., 10:]))
+        expected = sample(reference, FakeArchitecture(), prefix=float(index), schedule=schedule)
+        for actual, target in zip((video, action), expected):
+            torch.testing.assert_close(actual, target, rtol=0, atol=0)
+    sampler.reset()
+    sample(sampler, architecture, schedule=schedule)
+    assert sampler.last_stats["cold"]
+    sample(sampler, architecture, prompt="new prompt", schedule=schedule)
+    assert sampler.last_stats["cold"]
+
+
+def test_current_video_candidates_match_reference_formula():
+    from openwam.deploy.joint_solver import current_video_candidates
+
+    noise = torch.randn(1, 2, 3, 2, 2)
+    prefix = torch.randn(1, 2, 1, 2, 2)
+    sigmas = torch.tensor([1.0, .8, .5, .2, 0.0])
+    actual = current_video_candidates(noise, prefix, sigmas)
+    expected = torch.stack([sigma * noise + (1 - sigma) * prefix.expand_as(noise) for sigma in sigmas])
+    expected[:, :, :, :1] = prefix.unsqueeze(0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_affine_scan_matches_reference_matrix():
+    from openwam.deploy.joint_solver import AffineScan
+
+    sigmas = torch.tensor([1., .8, .5, .2, 0.])
+    candidates = torch.randn(5, 1, 32, 10)
+    velocity = torch.randn_like(candidates[:-1])
+    matrix = torch.zeros(4, 4)
+    for index in range(4):
+        ratio = sigmas[index + 1] / sigmas[index]
+        if index:
+            matrix[index] = ratio * matrix[index - 1]
+        matrix[index, index] = 1 - ratio
+    endpoints = candidates[:-1] - sigmas[:-1, None, None, None] * velocity
+    expected = (matrix @ endpoints.flatten(1)).reshape_as(endpoints)
+    expected += sigmas[1:, None, None, None] * candidates[0]
+    actual = AffineScan(sigmas)(candidates, velocity, velocity_sign=-1)
+    torch.testing.assert_close(actual, torch.cat((candidates[:1], expected)))
+
+
+def test_action_history_shared_conditions_match_and_restore():
+    from torch import nn
+
+    architecture = FakeArchitecture()
+    projection = nn.Linear(4, 2).eval()
+    architecture.named_modules = lambda: [("video.text_embedding", projection)]
+    original_forward = architecture.forward
+
+    def projected_forward(actions, action_time, **values):
+        condition = projection(values["context"]).mean(dim=(1, 2))
+        video, action = original_forward(actions, action_time, **values)
+        return video + condition[:, None, None, None, None], action + condition[:, None, None]
+
+    architecture.forward = projected_forward
+    shared = JointParaFlowSampler(history_scope="action_only", share_conditions=True, cache_schedule=True)
+    reference = JointParaFlowSampler(history_scope="action_only")
+    for index in range(8):
+        actual = sample(shared, architecture, prefix=float(index))
+        expected = sample(reference, architecture, prefix=float(index))
+        for value, target in zip(actual, expected):
+            torch.testing.assert_close(value, target, rtol=0, atol=0)
+    assert shared.last_stats["condition_sharing"]["shared_calls"] == 1
+    assert "forward" not in projection.__dict__
+
+
+def test_invalid_history_scope():
+    with pytest.raises(ValueError, match="history scope"):
+        JointParaFlowSampler(history_scope="unknown")
 
 
 def test_cached_schedule_matches_default_over_resets():

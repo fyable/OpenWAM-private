@@ -174,6 +174,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         proprio: Optional[Tensor] = None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
+        research_step=None,
         **pipeline_inputs,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         vb = self.video_backbone
@@ -184,6 +185,11 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
                 "architecture.__init__ to enable forward()."
             )
 
+        if research_step is not None and (
+            self.training or use_gradient_checkpointing or use_gradient_checkpointing_offload
+            or getattr(self, "_compiled_mot_run_joint_loop", None) is not None
+        ):
+            raise ValueError("Research forward requires eager evaluation without gradient checkpointing")
         pipeline_inputs = self._append_proprio_context_token(dict(pipeline_inputs), proprio)
         action_context = pipeline_inputs.get("context")
         action_context_mask = pipeline_inputs.get("context_mask")
@@ -244,6 +250,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
                 astate,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                **({"research_step": research_step} if research_step is not None else {}),
             )
         return vb.finalize(vstate), ab.extract_prediction(astate)
 

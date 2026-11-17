@@ -21,7 +21,9 @@ def couple_noise(previous, fresh, advance, horizon):
     return result
 
 
-def align_trajectory(trajectory, fresh, remaining, advance, horizon):
+def align_trajectory(trajectory, fresh, remaining, advance, horizon, *, tail_state_init="stage_residual"):
+    if tail_state_init not in ("stage_residual", "endpoint_bridge"):
+        raise ValueError(f"Unknown tail initialization: {tail_state_init}")
     if len(trajectory) != len(remaining):
         raise ValueError("Trajectory and sigma counts disagree")
     noise = couple_noise(trajectory[0], fresh, advance, horizon)
@@ -29,8 +31,11 @@ def align_trajectory(trajectory, fresh, remaining, advance, horizon):
     result[..., :horizon - advance, :] = trajectory[..., advance:horizon, :]
     if advance:
         scales = (remaining / remaining[0]).to(noise).reshape(-1, *([1] * noise.ndim))
-        residual = trajectory[..., horizon - 1:horizon, :].float()
-        residual = residual - scales * trajectory[0, ..., horizon - 1:horizon, :].float()
+        if tail_state_init == "stage_residual":
+            residual = trajectory[..., horizon - 1:horizon, :].float()
+            residual = residual - scales * trajectory[0, ..., horizon - 1:horizon, :].float()
+        else:
+            residual = (1 - scales) * trajectory[-1, ..., horizon - 1:horizon, :].float()
         result[..., horizon - advance:horizon, :] = residual + scales * noise[..., horizon - advance:horizon, :]
     result[0] = noise
     return result
@@ -70,6 +75,18 @@ def euler_prefix(noise, velocities, *, sigmas):
     return torch.cat((first, first + (velocities.float() * intervals).cumsum(0)))
 
 
+def current_video_candidates(noise, clean_prefix, sigmas):
+    if noise.ndim != 5 or clean_prefix.shape != noise[:, :, :1].shape:
+        raise ValueError("Expected video noise and one current clean prefix")
+    if sigmas.ndim != 1 or len(sigmas) < 2 or not bool(sigmas[0] > 0):
+        raise ValueError("Expected positive initial video sigma")
+    scales = (sigmas / sigmas[0]).float().reshape(-1, 1, 1, 1, 1, 1)
+    reference = clean_prefix.float().expand_as(noise)
+    candidates = scales * noise.float().unsqueeze(0) + (1 - scales) * reference.unsqueeze(0)
+    candidates[:, :, :, :1] = clean_prefix.float().unsqueeze(0)
+    return candidates
+
+
 @dataclass(frozen=True)
 class VideoPhasePlan:
     action_horizon: int
@@ -97,14 +114,14 @@ class VideoPhasePlan:
         return self.advance * self.phases // self.actions_per_latent
 
 
-def align_video_trajectory(trajectory, fresh, remaining, shift, clean_prefix):
+def align_video_trajectory(trajectory, fresh, remaining, shift, clean_prefix, *, tail_state_init="stage_residual"):
     if trajectory.ndim != 6 or fresh.ndim != 5 or trajectory.shape[1:] != fresh.shape:
         raise ValueError("Video history shape mismatch")
     if clean_prefix is None or clean_prefix.shape != fresh[:, :, :1].shape:
         raise ValueError("Expected one clean observed prefix")
     future = trajectory[:, :, :, 1:].movedim(3, 2)
     noise = fresh[:, :, 1:].movedim(2, 1).flatten(2)
-    aligned = align_trajectory(future.flatten(3), noise, remaining, shift, noise.shape[-2])
+    aligned = align_trajectory(future.flatten(3), noise, remaining, shift, noise.shape[-2], tail_state_init=tail_state_init)
     aligned = aligned.reshape(future.shape).movedim(2, 3)
     prefix = clean_prefix.float().unsqueeze(0).expand(len(trajectory), -1, -1, -1, -1, -1)
     return torch.cat((prefix, aligned), dim=3)

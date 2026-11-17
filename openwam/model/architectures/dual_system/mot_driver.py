@@ -163,6 +163,7 @@ class DualSystemMoTDriver:
         *,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
+        research_step=None,
     ) -> Tuple["BlockLoopState", "ActionState"]:
         """Run one mixed-attention layer.
 
@@ -183,10 +184,13 @@ class DualSystemMoTDriver:
         recomputes mixed attention.
         """
         if use_gradient_checkpointing and self.ab.training:
+            if research_step is not None:
+                raise ValueError("Research interventions do not support training/checkpointing")
             return self._step_checkpointed(
                 layer_id, vstate, astate, attn_mask=attn_mask, offload=use_gradient_checkpointing_offload
             )
-        return self._step_impl(layer_id, vstate, astate, attn_mask=attn_mask)
+        return self._step_impl(layer_id, vstate, astate, attn_mask=attn_mask,
+                               **({"research_step": research_step} if research_step is not None else {}))
 
     def _step_impl(
         self,
@@ -196,6 +200,7 @@ class DualSystemMoTDriver:
         attn_mask: Optional[Tensor] = None,
         *,
         suppress_inner_attn_ckpt: bool = False,
+        research_step=None,
     ) -> Tuple["BlockLoopState", "ActionState"]:
         """Unwrapped per-layer body. See :meth:`step` for the public entry point.
 
@@ -237,7 +242,18 @@ class DualSystemMoTDriver:
         # passes it in for every layer. _step_impl does NOT rebuild the mask
         # itself; any direct caller must pass the same pre-built mask.
 
-        if self.mot_checkpoint_mixed_attn and ab.training and not suppress_inner_attn_ckpt:
+        if research_step is not None and research_step.selected(layer_id):
+            from openwam.research.interventions import intervene_attention
+
+            mixed = intervene_attention(
+                q_cat, k_cat, v_cat, attn_mask, heads=self.num_heads, video_tokens=s_video,
+                tokens_per_frame=self._video_tokens_per_frame(vstate), grid_frames=int(vstate.grid_frames),
+                layer=layer_id, step=research_step,
+            )
+            research_step.context.layouts[layer_id].update(
+                grid_height=int(vstate.grid_height), grid_width=int(vstate.grid_width)
+            )
+        elif self.mot_checkpoint_mixed_attn and ab.training and not suppress_inner_attn_ckpt:
             mixed = torch.utils.checkpoint.checkpoint(
                 self._mixed_attention, q_cat, k_cat, v_cat, attn_mask, use_reentrant=False
             )
@@ -310,6 +326,7 @@ class DualSystemMoTDriver:
         *,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
+        research_step=None,
     ) -> Tuple["BlockLoopState", "ActionState"]:
         """Run the full per-layer loop over both modalities.
 
@@ -356,6 +373,7 @@ class DualSystemMoTDriver:
                 attn_mask=attn_mask,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                **({"research_step": research_step} if research_step is not None else {}),
             )
         return vstate, astate
 

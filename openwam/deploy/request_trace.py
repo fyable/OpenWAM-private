@@ -12,7 +12,8 @@ import numpy as np
 
 
 class RequestTrace:
-    def __init__(self, directory, *, warmup=48, measure=120, max_requests=10000, metadata=None):
+    def __init__(self, directory, *, warmup=48, measure=120, max_requests=10000, metadata=None,
+                 record_all=False, include_outputs=False):
         if warmup < 0 or measure < 1 or max_requests < 3:
             raise ValueError("Invalid trace limits")
         self.directory = Path(directory)
@@ -29,14 +30,20 @@ class RequestTrace:
         self.previous_prompt = None
         self.pending_reset = True
         self.complete = False
+        self.record_all = record_all
+        self.include_outputs = include_outputs
 
     def reset(self):
         self.pending_reset = True
 
-    def record(self, conditions):
+    def record(self, conditions, result=None):
         if self.complete:
             return
         if self.count >= self.max_requests:
+            if self.record_all:
+                (self.directory / "capped.json").write_text(json.dumps({"requests": self.count}))
+                self.complete = True
+                return
             raise RuntimeError("Trace reached max_requests before collecting enough warm observations")
         images = conditions.get("first_frame_image")
         if not isinstance(images, (list, tuple)) or len(images) != 1:
@@ -55,9 +62,15 @@ class RequestTrace:
             self.episode_request = 0
         path = self.directory / f"request_{self.count:06d}.npz"
         temporary = path.with_suffix(".tmp")
+        outputs = {}
+        if self.include_outputs:
+            actions = np.asarray(result["actions"])
+            if not np.isfinite(actions).all():
+                raise ValueError("Trace requires finite generated actions")
+            outputs["actions"] = actions
         with temporary.open("xb") as stream:
             np.savez(stream, image=image, state=state, prompt=np.array(prompt),
-                     episode_start=np.array(start))
+                     episode_start=np.array(start), **outputs)
         temporary.replace(path)
         if self.count >= self.warmup and self.episode_request >= 2:
             self.warm_count += 1
@@ -65,7 +78,7 @@ class RequestTrace:
         self.episode_request += 1
         self.previous_prompt = prompt
         self.pending_reset = False
-        if self.warm_count >= self.measure:
+        if not self.record_all and self.warm_count >= self.measure:
             marker = self.directory / "complete.json"
             temporary = marker.with_suffix(".tmp")
             temporary.write_text(json.dumps({"requests": self.count, "warm_requests": self.warm_count,
@@ -85,13 +98,17 @@ def attach_request_trace(engine):
     trace = RequestTrace(Path(directory) / f"session_{uuid.uuid4().hex}",
                          warmup=int(os.environ.get("OPENWAM_TRACE_WARMUP", "48")),
                          measure=int(os.environ.get("OPENWAM_TRACE_MEASURE", "120")),
+                         max_requests=int(os.environ.get("OPENWAM_TRACE_MAX_REQUESTS", "10000")),
+                         record_all=os.environ.get("OPENWAM_TRACE_ALL", "0") == "1",
+                         include_outputs=os.environ.get("OPENWAM_TRACE_OUTPUTS", "0") == "1",
                          metadata={"sampler": getattr(engine.cfg.inference, "sampler", "native"),
+                                   "benchmark": getattr(getattr(engine.cfg, "dataloader", None), "type", None),
                                    "steps": getattr(engine.cfg.inference, "denoise_steps", None), "advance": 8})
     original_generate, original_reset = engine.generate, engine.reset
 
     def generate(conditions):
         result = original_generate(conditions)
-        trace.record(conditions)
+        trace.record(conditions, result)
         return result
 
     def reset():

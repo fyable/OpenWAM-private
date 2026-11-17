@@ -11,6 +11,10 @@ server:
 # an async-tuned yaml can be run as the sync baseline with a single flag.
 inference:
   sampler: native
+  joint_execution_backend: legacy
+  joint_execution_profile: false
+  joint_execution_allow_parity_failure: false
+  request_timing: false
   denoise_steps: 10
 
   denoise_mode: sync          # trajectory: sync | async; separate from inference_mode

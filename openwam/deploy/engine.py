@@ -120,8 +120,32 @@ class JointInferenceEngine(BaseInferenceEngine):
         self._init_cfg()
         self._joint_sampler = None
         sampler = getattr(cfg.inference, "sampler", "native")
-        if sampler not in ("native", "joint-paraflow"):
+        if sampler not in ("native", "joint-paraflow", "isolated-native", "isolated-paraflow"):
             raise ValueError(f"Unknown inference sampler: {sampler}")
+        if sampler.startswith("isolated-"):
+            from openwam.deploy.isolated_reference import IsolatedReferenceSampler, configure_isolated, DEFAULT_PARAFLOW, DEFAULT_NATIVE
+
+            compile_cfg = getattr(getattr(cfg, "optimization", None), "compile", None)
+            if (compile_cfg is not None and getattr(compile_cfg, "enabled", False)) or self._dit_cache is not None:
+                raise ValueError("Isolated ablation requires compile and DiT cache disabled")
+            if self._decode_video or self._cfg_scale != 1.0:
+                raise ValueError("Isolated ablation requires decode_video=false and cfg_scale=1")
+            if (getattr(cfg.inference, "inference_horizon", None) != 8
+                    or getattr(cfg.inference, "inference_mode", "sync") != "sync"
+                    or getattr(cfg.inference, "denoise_mode", "sync") != "sync"):
+                raise ValueError("Isolated ablation requires H32/E8 synchronous inference")
+            self._joint_sampler = IsolatedReferenceSampler(
+                method=sampler.removeprefix("isolated-"),
+                paraflow_root=getattr(cfg.inference, "isolated_paraflow_root", DEFAULT_PARAFLOW),
+                native_root=getattr(cfg.inference, "isolated_native_root", DEFAULT_NATIVE),
+                allow_partition_failure=bool(getattr(cfg.inference, "isolated_allow_parity_failure", False)))
+            original_mask = configure_isolated(architecture)
+            if original_mask == "isolated":
+                self._joint_sampler.checkpoint_semantics = "original_isolated_checkpoint"
+                logger.info("Original isolated checkpoint mask retained; reference=%s", self._joint_sampler.identity)
+            else:
+                logger.warning("Experimental checkpoint mask override: %s -> isolated; not original isolated weights; reference=%s",
+                               original_mask, self._joint_sampler.identity)
         if sampler == "joint-paraflow":
             from openwam.deploy.parallel_joint import JointParaFlowSampler
 
@@ -138,10 +162,21 @@ class JointInferenceEngine(BaseInferenceEngine):
             if compile_cfg is not None and getattr(compile_cfg, "enabled", False):
                 raise ValueError("joint-paraflow v1 requires compile.enabled=false")
             self._dit_cache = None
-            self._joint_sampler = JointParaFlowSampler(advance=cfg.inference.inference_horizon)
+            self._joint_sampler = JointParaFlowSampler(
+                advance=cfg.inference.inference_horizon,
+                cache_schedule=bool(getattr(cfg.inference, "joint_cache_schedule", False)),
+                share_conditions=bool(getattr(cfg.inference, "joint_share_conditions", False)),
+                history_scope=getattr(cfg.inference, "joint_history_scope", "phase_video_action"),
+                action_tail_init=getattr(cfg.inference, "joint_action_tail_init", "stage_residual"),
+                video_tail_init=getattr(cfg.inference, "joint_video_tail_init", "stage_residual"),
+                execution_backend=getattr(cfg.inference, "joint_execution_backend", "legacy"),
+                execution_profile=bool(getattr(cfg.inference, "joint_execution_profile", False)),
+                allow_execution_parity_failure=bool(getattr(cfg.inference, "joint_execution_allow_parity_failure", False)),
+            )
             logger.info("joint-paraflow core identity=%s", self._joint_sampler.identity)
 
     def reset(self):
+        self._timing_request_index = 0
         sampler = getattr(self, "_joint_sampler", None)
         if sampler is not None:
             sampler.reset()
@@ -309,8 +344,24 @@ class JointInferenceEngine(BaseInferenceEngine):
             dict with ``video`` (list of PIL images or None) and ``actions`` (numpy array).
         """
         inf_cfg = self.cfg.inference
+        research_context = conditions.get("research_context")
+        if research_context is not None:
+            from openwam.research.interventions import Intervention, ResearchContext
+
+            if isinstance(research_context, dict):
+                research_context = ResearchContext(Intervention.from_dict(research_context))
+            if not isinstance(research_context, ResearchContext):
+                raise TypeError("research_context must be an intervention object or ResearchContext")
+            compile_cfg = getattr(getattr(self.cfg, "optimization", None), "compile", None)
+            if (self._dit_cache is not None or getattr(self, "_joint_sampler", None) is not None
+                or bool(getattr(compile_cfg, "enabled", False))
+                or getattr(inf_cfg, "inference_mode", "sync") != "sync"
+                or conditions.get("denoise_mode", getattr(inf_cfg, "denoise_mode", "sync")) != "sync"
+                or self._cfg_scale != 1):
+                raise ValueError("Research requires sync eager native inference, CFG=1 and no DiT cache")
         sampler = getattr(self, "_joint_sampler", None)
-        if sampler is not None:
+        request_timing = bool(getattr(inf_cfg, "request_timing", False))
+        if sampler is not None or request_timing:
             if torch.cuda.is_available():
                 torch.cuda.synchronize(self.architecture.device)
             request_started = time.perf_counter()
@@ -395,6 +446,8 @@ class JointInferenceEngine(BaseInferenceEngine):
                 "cfg_merge": self._cfg_merge,
             }
         )
+        if research_context is not None:
+            generate_kwargs["research_context"] = research_context
         if getattr(self, "_joint_sampler", None) is not None:
             if denoise_mode != "sync":
                 raise ValueError("joint-paraflow does not support asynchronous denoising")
@@ -405,6 +458,14 @@ class JointInferenceEngine(BaseInferenceEngine):
                 torch.cuda.synchronize(self.architecture.device)
             result["sampler_stats"]["full_request_ms"] = (time.perf_counter() - request_started) * 1000
             logger.info("joint-paraflow request stats=%s", result["sampler_stats"])
+        elif request_timing:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.architecture.device)
+            index = getattr(self, "_timing_request_index", 0)
+            result["request_timing"] = {"sampler": "native", "cold": index < 2,
+                                       "full_request_ms": (time.perf_counter() - request_started) * 1000}
+            self._timing_request_index = index + 1
+            logger.info("openwam request stats=%s", result["request_timing"])
 
         # Attach optimization stats if profiling
         if self._profile and self._dit_cache is not None:

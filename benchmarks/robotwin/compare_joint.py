@@ -101,20 +101,24 @@ def preflight(cfg):
     architecture = training["model"]["architecture"]
     loader = training["dataloader"]
     if (architecture.get("framework") != "dual_system" or architecture.get("variant") != "joint_self_attn"
-            or architecture.get("attention_mask_mode") != "mutual" or loader.get("type") != "robotwin"
+            or architecture.get("attention_mask_mode") != getattr(cfg, "expected_mask", "mutual") or loader.get("type") != "robotwin"
             or loader.get("num_frames") != 33 or loader.get("video_stride") != 4
             or loader.get("action_mode") != "eef"):
-        raise ValueError("Expected RoboTwin eef joint_self_attn/mutual checkpoint with H32/video_stride=4")
+        raise ValueError("Expected RoboTwin eef joint_self_attn checkpoint with matching attention mask and H32/video_stride=4")
 
 
 def protocol(cfg):
     sources = set((ROOT / "openwam/deploy").glob("*.py"))
-    sources.update((ROOT / "openwam/model/architectures").glob("*.py"))
+    sources.update((ROOT / "openwam/model/architectures").rglob("*.py"))
+    sources.update((ROOT / "openwam/model/video_backbone").rglob("*.py"))
+    sources.update((ROOT / "openwam/model/action_backbone").rglob("*.py"))
     sources.update(HERE.glob("*.py"))
     sources.update(HERE.glob("*.yml"))
     sources.update((ROOT / "openwam/dataloader").rglob("*robotwin*.py"))
+    sources.add(ROOT / "openwam/dataloader/utils/unify_action.py")
     sources.update([ROOT / "configs/deploy.yaml", ROOT / "scripts/deploy.py",
-                    HERE / "multi_eval.sh", ROOT / "scripts/compare_alpha_robotwin.sh"])
+                    HERE / "multi_eval.sh", ROOT / "scripts/compare_alpha_robotwin.sh",
+                    ROOT / "scripts/compare_alpha_robotwin_joint_isolated.sh"])
     watched = [cfg.robotwin / name for name in ("script", "envs", "task_config", "policy", "description")]
     upstream = {str(path.relative_to(cfg.robotwin)): digest(path)
                 for directory in watched for path in sorted(directory.rglob("*"))
@@ -123,9 +127,11 @@ def protocol(cfg):
     body = {
         "version": 1, "diagnostic": cfg.diagnostic, "mode": "demo_clean", "tasks": cfg.tasks,
         "episodes_per_task": cfg.episodes, "seed": 0, "instruction_type": "unseen",
-        "methods": {name: list(spec) for name, spec in METHODS.items()},
+        "methods": {name: list(spec) for name, spec in getattr(cfg, "methods", METHODS).items()},
         "inference_horizon": 8, "inference_mode": "sync", "denoise_mode": "sync",
         "compile": False, "dit_cache": False, "decode_video": False, "cfg_scale": 1.0,
+        "deploy_overrides": getattr(cfg, "deploy_overrides", []),
+        "server_environment": getattr(cfg, "server_environment", {}),
         "checkpoint": str(cfg.weight), "checkpoint_size": stat.st_size, "checkpoint_mtime_ns": stat.st_mtime_ns,
         "checkpoint_config": digest(cfg.checkpoint / "config.yaml"),
         "normalization_stats": digest(cfg.checkpoint / "normalization_stats.npy"),
@@ -244,13 +250,14 @@ def run_client(cfg, task, directory, manifest_path=None, server=None):
 
 
 def server_command(cfg, method, token):
-    sampler, steps = METHODS[method]
+    cfg = getattr(cfg, "method_configs", {}).get(method, cfg)
+    sampler, steps = getattr(cfg, "methods", METHODS)[method]
     return [cfg.server_python, str(ROOT / "scripts/deploy.py"), "--ckpt-dir", str(cfg.checkpoint),
             "--ckpt-name", cfg.weight.name, "--device", "cuda:0", "--host", "127.0.0.1",
             "--port", str(cfg.port), "--readiness-token", token, "--sampler", sampler,
             "--denoise-steps", str(steps), "--inference-horizon", "8", "--inference-mode", "sync",
             "--denoise-mode", "sync", "--compile-enabled", "false", "inference.cfg_scale=1.0",
-            "optimization.dit_cache.enabled=false", "optimization.decode_video=false"]
+            "optimization.dit_cache.enabled=false", "optimization.decode_video=false", *getattr(cfg, "deploy_overrides", [])]
 
 
 def probe_server(port):
@@ -293,8 +300,10 @@ def policy_server(cfg, method):
     owned = ProcessRegistry()
     try:
         log = (directory / "server.log").open("w")
+        selected = getattr(cfg, "method_configs", {}).get(method, cfg)
         process = spawn_resource(command, cwd=ROOT,
-                                 env=dict(os.environ, CUDA_VISIBLE_DEVICES=cfg.gpu, PYTHONUNBUFFERED="1"), stdout=log)
+                                 env=dict(os.environ, CUDA_VISIBLE_DEVICES=cfg.gpu, PYTHONUNBUFFERED="1",
+                                          **getattr(selected, "server_environment", {})), stdout=log)
         owned.add(process, log)
         print(f"Starting {method}; log={directory / 'server.log'}", flush=True)
         wait_ready(process, cfg.port, token, cfg.timeout)
@@ -316,10 +325,11 @@ def joint_timings(root):
     for path in sorted((root / "servers").glob("*/server.log")):
         with path.open(errors="replace") as handle:
             for line in handle:
-                if "joint-paraflow request stats=" not in line:
+                marker = next((value for value in ("joint-paraflow request stats=", "openwam request stats=") if value in line), None)
+                if marker is None:
                     continue
                 try:
-                    stats = ast.literal_eval(line.split("joint-paraflow request stats=", 1)[1].strip())
+                    stats = ast.literal_eval(line.split(marker, 1)[1].strip())
                     value = float(stats["full_request_ms"])
                     if value >= 0 and value < float("inf"):
                         groups["cold" if stats["cold"] else "warm"].append(value)
@@ -335,7 +345,8 @@ def summarize(root):
     report = {"protocol_identity": recorded["identity"], "diagnostic": recorded["diagnostic"],
               "timing_note": "Joint timings include all attempts, including interrupted/retried tasks; not paired Native speedups.",
               "methods": {}}
-    for method in METHODS:
+    methods = recorded.get("methods", METHODS)
+    for method in methods:
         successes = 0
         episodes = 0
         rows = {}
@@ -358,8 +369,29 @@ def summarize(root):
             "expected_episodes": len(tasks) * total, "tasks_complete": len(tasks) - len(missing),
             "tasks_expected": len(tasks), "missing_tasks": missing,
             "success_rate": successes / episodes if episodes else None, "tasks": rows,
-            "joint_request_timing": joint_timings(root / method) if method == "joint_n4_e8" else {},
+            "joint_request_timing": joint_timings(root / method),
         }
+    if recorded.get("method_protocols"):
+        report["checkpoint_note"] = "Different trained checkpoints: compare optimization within each family, not cross-mask algorithm speedups."
+    baseline = report["methods"].get("joint_parallel_n10")
+    if baseline:
+        report["joint_quality_gate"] = {method: row["status"] == "complete" and baseline["status"] == "complete"
+                                       and row["successes"] >= baseline["successes"]
+                                       for method, row in report["methods"].items() if method in ("joint_prepared_n10", "joint_prefix_n10")}
+        report["paired_quality_differences"] = {}
+        for method in report["joint_quality_gate"]:
+            differences = []
+            for task in tasks:
+                try:
+                    reference = read_json(root / "joint_parallel_n10/results" / f"{task}.json")["episodes"]
+                    candidate = read_json(root / method / "results" / f"{task}.json")["episodes"]
+                except (OSError, ValueError, KeyError):
+                    continue
+                for original, changed in zip(reference, candidate):
+                    if original["success"] != changed["success"]:
+                        differences.append({"task": task, "episode": original["episode"], "seed": original["seed"],
+                                            "legacy_success": original["success"], "candidate_success": changed["success"]})
+            report["paired_quality_differences"][method] = differences
     write_json(root / "comparison.json", report)
     lines = ["# RoboTwin Joint comparison", "", f"Diagnostic: {recorded['diagnostic']}; mode: demo_clean", "",
              "| Method | Status | Complete tasks | Success/Episodes | Rate (completed tasks only) |",
@@ -369,10 +401,25 @@ def summarize(root):
         text = f"{row['successes']}/{row['episodes']}"
         print(f"{method:20s} {row['status']:10s} {text} ({rate}); tasks {row['tasks_complete']}/{len(tasks)}", flush=True)
         lines.append(f"| {method} | {row['status']} | {row['tasks_complete']}/{len(tasks)} | {text} | {rate} |")
-    lines += ["", "## Per-task successes", "", "| Task | Native N10 | Native N4 | Joint N4 |", "|---|---:|---:|---:|"]
+    lines += ["", "## Per-task successes", "", "| Task | " + " | ".join(methods) + " |",
+              "|---|" + "---:|" * len(methods)]
     for task in tasks:
-        values = [report["methods"][method]["tasks"][task].get("successes", "incomplete") for method in METHODS]
+        values = [report["methods"][method]["tasks"][task].get("successes", "incomplete") for method in methods]
         lines.append(f"| {task} | " + " | ".join(map(str, values)) + " |")
+    lines += ["", "## Warm request timing (diagnostic, not paired replay)", "",
+              "| Method | Count | P50 ms | P95 ms |", "|---|---:|---:|---:|"]
+    for method, row in report["methods"].items():
+        timing = row["joint_request_timing"].get("warm")
+        if timing:
+            lines.append(f"| {method} | {timing['count']} | {timing['p50_ms']:.3f} | {timing['p95_ms']:.3f} |")
+    lines += ["", report.get("checkpoint_note", "Same-checkpoint comparison."),
+              "Quality gates: " + str(report.get("joint_quality_gate", {}))]
+    if report.get("paired_quality_differences"):
+        lines += ["", "## Paired episode differences versus Joint legacy", "",
+                  "| Method | Task | Episode | Seed | Legacy success | Candidate success |", "|---|---|---:|---:|---|---|"]
+        for method, differences in report["paired_quality_differences"].items():
+            for row in differences:
+                lines.append(f"| {method} | {row['task']} | {row['episode']} | {row['seed']} | {row['legacy_success']} | {row['candidate_success']} |")
     lines += ["", report["timing_note"]]
     (root / "comparison.md").write_text("\n".join(lines) + "\n")
     print(f"Report: {root / 'comparison.md'}", flush=True)
@@ -381,8 +428,17 @@ def summarize(root):
 
 def campaign(cfg):
     preflight(cfg)
+    extra_protocols = {}
+    for method, selected in getattr(cfg, "method_configs", {}).items():
+        preflight(selected)
+        extra_protocols[method] = protocol(selected)
+    identity = protocol(cfg)
+    if extra_protocols:
+        identity["method_protocols"] = extra_protocols
+        identity["reference_sources"] = cfg.reference_sources
+        identity["identity"] = content_hash({key: value for key, value in identity.items() if key != "identity"})
     with output_lock(cfg.root):
-        check_protocol(cfg.root, protocol(cfg))
+        check_protocol(cfg.root, identity)
         shutil.copyfile(HERE / "policy_config.yml", cfg.root / "policy_config.yml")
         shutil.copyfile(HERE / "step_limits.yml", cfg.root / "step_limits.yml")
         try:
@@ -396,7 +452,7 @@ def campaign(cfg):
                 run_client(cfg, task, directory)
                 manifest = check_manifest(directory / "result.json", task, cfg.episodes)
                 write_json(path, manifest)
-            for method in METHODS:
+            for method in getattr(cfg, "methods", METHODS):
                 pending = []
                 for task in cfg.tasks:
                     path = cfg.root / "manifests" / f"{task}.json"

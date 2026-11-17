@@ -1386,6 +1386,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         cfg_merge: bool = False,
         active_action_mask: Optional[Tensor] = None,
         joint_sampler=None,
+        research_context=None,
         **extra_pipeline_inputs: Any,
     ) -> dict:
         """Execute joint video-action denoising driven by a schedule.
@@ -1433,6 +1434,19 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # (cond, uncond) slot. CFG is applied by the denoising loop below, not
         # forwarded to the backbone preprocess (Wan does no CFG at inference).
         cfg_scale_f = float(cfg_scale)
+        if research_context is not None:
+            from openwam.model.architectures.dual_system.joint_self_attn import DualSystemSelfAttnArchitecture
+            from openwam.research.interventions import ResearchContext
+
+            if not isinstance(research_context, ResearchContext):
+                raise TypeError("research_context must be a ResearchContext")
+            if not isinstance(self, DualSystemSelfAttnArchitecture):
+                raise ValueError("Research mode supports dual_system joint_self_attn only")
+            if cfg_scale_f != 1 or dit_cache is not None or joint_sampler is not None:
+                raise ValueError("Research mode requires CFG=1, no DiT cache, and the native sampler")
+            if getattr(self, "_compiled_mot_run_joint_loop", None) is not None:
+                raise ValueError("Research mode requires compile disabled")
+            research_context.begin(len(schedule) - 1, vb.num_layers)
         if cfg_scale_f < 1.0:
             raise ValueError(f"cfg_scale must be >= 1.0; got {cfg_scale!r}.")
         if cfg_scale_f > 1.0:
@@ -1481,6 +1495,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
             latents = inputs_shared["latents"].clone()
             latents[:, :, : ref_latents.shape[2]] = ref_latents
             inputs_shared["latents"] = latents
+        if research_context is not None and (ref_latents is None or inputs_shared["latents"].shape[0] != 1):
+            raise ValueError("Research mode requires batch=1 and an explicit clamped observation prefix")
         if self.uses_proprioception:
             if proprio is None:
                 raise ValueError("use_proprioception=True requires `proprio` during generation.")
@@ -1563,12 +1579,23 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     )
                 else:
                     torch.compiler.cudagraph_mark_step_begin()
+                    research_kwargs = {}
+                    if research_context is not None:
+                        if not video_stepping or not action_stepping:
+                            raise ValueError("Research mode requires synchronous denoising")
+                        research_kwargs["research_step"] = research_context.step(
+                            i, sigma_v, sigma_a, int(ref_latents.shape[2]), video_stepping, action_stepping,
+                            latent_frames=int(inputs_shared["latents"].shape[2]),
+                        )
                     noise_pred, action_noise_pred = self.forward(
                         action_latents,
                         a_timestep,
                         **inputs_shared,
                         timestep=v_timestep,
+                        **research_kwargs,
                     )
+                    if research_context is not None and action_noise_pred is not None:
+                        research_context.predictions[i] = action_noise_pred.detach().float().cpu().clone()
                 if dit_cache is not None and video_stepping:
                     dit_cache.update(noise_pred, sigma_v, action_noise_pred)
 
@@ -1606,6 +1633,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         else:
             video_frames = None
 
+        if research_context is not None:
+            research_context.normalized_actions = action_latents.squeeze(0).detach().float().cpu().clone()
         actions = action_latents.squeeze(0).float().cpu().numpy()
         normalizer = getattr(self, "normalizer", None)
         if normalizer is not None:

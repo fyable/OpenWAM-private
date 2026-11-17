@@ -473,7 +473,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--readiness-token", help=argparse.SUPPRESS)
     parser.add_argument(
         "--sampler",
-        choices=("native", "joint-paraflow"),
+        choices=("native", "joint-paraflow", "isolated-native", "isolated-paraflow"),
         default=None,
         help="Experimental joint-paraflow requires H32/E8, sync mode and compile disabled.",
     )

@@ -74,6 +74,105 @@ Modes:
 - `summary`: read saved results and regenerate `comparison.json` / `comparison.md`,
   without launching jobs; exits nonzero while any task/method is incomplete.
 
+### Four-arm Joint / isolated comparison
+
+```bash
+bash scripts/compare_alpha_robotwin_joint_isolated.sh plan
+bash scripts/compare_alpha_robotwin_joint_isolated.sh preflight
+GPU=6 bash scripts/compare_alpha_robotwin_joint_isolated.sh diagnostic
+```
+
+The default runs `adjust_bottle`, five shared manifest episodes per method (20 total):
+Joint Native N10, Joint parallel N10, isolated Native N10, and isolated original
+ParaFlow N10. Joint uses `/data1/wam-ckpts/OpenWAM-Alpha-Sim-RoboTwin-Full`;
+isolated uses step 9890 under
+`/data2/jikangye/research/runs/paraflow/hardware-ablation-20261017/wam-port/assets/openwam`.
+Override with `JOINT_CKPT_DIR` and `ISOLATED_CKPT_DIR`. Preflight checks the original
+checkpoint mask; it does not silently treat mutual weights as isolated training.
+Both checkpoint identities and original ParaFlow source hashes are saved for resume.
+
+Set `TASKS=adjust_bottle,open_laptop EPISODES=5` for a larger diagnostic.
+`full` runs 50 tasks, 100 episodes, four methods (20,000 episodes).
+Outputs default to `outputs/robotwin/joint_isolated_diagnostic` or
+`outputs/robotwin/joint_isolated_full`; use `COMPARE_ROOT` to select a fresh directory,
+or reuse the unchanged directory to resume. `summary` regenerates `comparison.md`
+and `comparison.json`. All four arms reuse the exact same eligible scene manifests.
+Compare optimization effects **within each checkpoint**: mutual generates future-video
+latents, isolated uses only current-frame conditioning, so cross-family timing is not
+an equivalent-workload algorithm speedup. Logged experimental request timings are
+diagnostic (including retries), not paired replay speed measurements; native full-joint
+request timings are not currently captured in that summary. Numerical gates stay strict.
+GPU compatibility and closed-loop success remain to be validated on the host.
+
+### Mutual Joint execution optimization
+
+Three opt-in execution backends keep the same N10/H32/E8 sampler, mutual mask,
+noise/history alignment, and FP32 scan: `legacy` (default), `prepared` (request-local
+text/proprio conditioning projections), and `prefix` (prepared conditioning plus
+clean-first-frame per-layer K/V prefill). Future video and action remain mutually
+coupled. Prefix dynamic queries keep original absolute RoPE positions and attend
+the original ordered full K/V; the complete video head still produces all frames.
+Cached visual/context values never survive an observation. Shared checkpoint and
+ParaFlow source directories are not modified.
+
+```bash
+# Five arms, three tasks, five matched episodes each = 75 episodes.
+GPU=6 bash scripts/compare_alpha_robotwin_joint_isolated.sh execution-ablation
+
+# Once the short quality check passes: legacy versus prefix, 60 paired scenes.
+GPU=6 bash scripts/compare_alpha_robotwin_joint_isolated.sh execution-regression
+
+# One command: ablation, separate real RoboTwin request capture, validated replay/profile.
+GPU=6 bash scripts/compare_alpha_robotwin_joint_isolated.sh execution-all
+```
+
+The five-arm ablation includes Joint Native, Joint legacy/prepared/prefix parallel,
+and original isolated ParaFlow as a reference. Defaults use `adjust_bottle`,
+`open_laptop`, `stack_blocks_two`; `TASKS` and `EPISODES` override diagnostic sizes.
+Default ablation output: `outputs/robotwin/joint_execution_ablation/`.
+Default regression output: `outputs/robotwin/joint_execution_regression/`.
+`execution-all` chooses a timestamped root; set `COMPARE_ROOT` explicitly to resume.
+It runs 75 quality episodes plus 15 capture episodes by default; the larger
+120-episode regression remains a separate explicit command.
+Do not reuse directories created by older code/protocol versions.
+
+Separate capture/replay is available:
+
+```bash
+GPU=6 bash scripts/compare_alpha_robotwin_joint_isolated.sh capture
+GPU=6 TRACE="$PWD/outputs/robotwin/joint_execution_capture/observations.npz" \
+  bash scripts/compare_alpha_robotwin_joint_isolated.sh replay
+```
+
+Capture records real E8 generation inputs and saves a provenance sidecar; replay
+rejects LIBERO/unverified traces and requires an exclusive GPU. With defaults it
+validates 48 warmup + 120 eligible warm requests, compares independent multi-request
+trajectories/executed actions, then separately times identical legacy-owned candidate
+histories with cloned RNG in seeded shuffled order. Validation can be expensive:
+frozen-candidate video/action velocities and batch-versus-independent partitions are
+checked separately at rtol/atol 0.05. Any nonfinite value is fatal. Replay saves
+`validation.json[l]`, `requests.jsonl`, `timing.md/json`, `profile.md/json`, and failure artifacts.
+`ALLOW_PARITY_FAILURE=1` applies only to replay diagnostics, never establishes equivalence.
+If capture has too few requests, increase task/episode coverage in a new root.
+
+`WARMUP`, `MEASURE`, `PROFILE_SAMPLES` (default 48/120/8) control replay. Profiling is
+a separate pass, with CUDA events for conditioning, prefix prefill, state preparation,
+joint blocks, heads, trajectory update/constraints and VAE encoding where available;
+Chrome traces additionally expose CPU/kernel behavior. `PROFILE_SAMPLES=0` disables
+profiling. Peak allocated/reserved memory is recorded; sampler histories coexist,
+and allocator-reserved memory depends on execution order. Do not interpret it as
+an isolated single-process model footprint.
+
+Acceptance: at least 10% lower paired prefix P50 and no P95 regression, strict numeric
+checks passed, and no success-count regression against same-run legacy in both short
+and 60-scene quality checks. Reports list per-episode quality changes. Passing replay
+alone never approves closed-loop quality. Native full-request timings are now opt-in
+for these ablations, but closed-loop timing remains diagnostic, not paired speedup.
+The default stays `legacy` regardless of results; no GPU speedup is claimed from CPU tests.
+Direct deployment uses `inference.joint_execution_backend=prepared|prefix` with
+`--sampler joint-paraflow`, compile/cache/decode disabled and CFG=1. Unsupported
+conditions fail explicitly rather than silently dropping video or changing the mask.
+
 All methods use synchronous E8 execution/denoising, CFG=1, and disabled compile,
 DiT cache and video decoding. The checkpoint's training observation/action
 configuration is retained, with the bundled end-effector RoboTwin policy adapter.

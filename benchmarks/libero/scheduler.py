@@ -484,6 +484,11 @@ def _resume_signature(
         "denoise_mode": args.denoise_mode,
         "denoise_steps": args.denoise_steps,
         "sampler": getattr(args, "sampler", "native"),
+        **(_isolated_identity(args) if str(getattr(args, "sampler", "native")).startswith("isolated-") else {}),
+        **({"joint_optimization_overrides": [value for value in args.extra_deploy_arg
+                                            if value.startswith(("inference.joint_cache_schedule=", "inference.joint_share_conditions=", "inference.joint_history_scope=", "inference.joint_action_tail_init=", "inference.joint_video_tail_init="))]}
+           if any(value.startswith(("inference.joint_cache_schedule=", "inference.joint_share_conditions=", "inference.joint_history_scope=", "inference.joint_action_tail_init=", "inference.joint_video_tail_init="))
+                  for value in getattr(args, "extra_deploy_arg", [])) else {}),
         **({"paraflow_core": _paraflow_core_identity()} if getattr(args, "sampler", "native") == "joint-paraflow" else {}),
         "diagnostic": getattr(args, "diagnostic", False),
         "trial_start": trial_run.trial_start,
@@ -498,6 +503,16 @@ def _paraflow_core_identity():
     from openwam.deploy.parallel_joint import core_identity
 
     return core_identity()
+
+
+def _isolated_identity(args):
+    from openwam.deploy.isolated_reference import load_reference, DEFAULT_PARAFLOW, DEFAULT_NATIVE
+
+    settings = dict(value.split("=", 1) for value in args.extra_deploy_arg if "=" in value)
+    identity = load_reference(settings.get("inference.isolated_paraflow_root", DEFAULT_PARAFLOW),
+                              settings.get("inference.isolated_native_root", DEFAULT_NATIVE))[-1]
+    return {"isolated_reference_identity": identity, "isolated_overrides": list(args.extra_deploy_arg),
+            "attention_semantics": "experimental_isolated_override_of_LIBERO_weights"}
 
 
 def _validate_resume_signature(output_dir: Path, expected: dict) -> None:
@@ -995,7 +1010,7 @@ def _summarize(
 
 
 def _preflight(args: argparse.Namespace) -> None:
-    if getattr(args, "sampler", "native") == "joint-paraflow":
+    if getattr(args, "sampler", "native") in ("joint-paraflow", "isolated-native", "isolated-paraflow"):
         if args.inference_horizon != 8 or args.inference_mode != "sync" or args.denoise_mode != "sync":
             raise ValueError("joint-paraflow requires E8 and synchronous execution/denoising")
         if args.compile_enabled != "false" or args.denoise_steps < 2:
@@ -1157,7 +1172,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the seed in policy_config.yml for every task environment",
     )
-    parser.add_argument("--sampler", choices=("native", "joint-paraflow"), default="native")
+    parser.add_argument("--sampler", choices=("native", "joint-paraflow", "isolated-native", "isolated-paraflow"), default="native")
     parser.add_argument("--diagnostic", action="store_true", help="Non-canonical five-trial-per-task diagnostic run")
     parser.add_argument("--denoise-steps", type=int, default=10)
     parser.add_argument("--denoise-mode", choices=("sync", "async"), default="sync")
@@ -1301,6 +1316,8 @@ def main(argv: list[str] | None = None) -> int:
         "denoise_mode": args.denoise_mode,
         "denoise_steps": args.denoise_steps,
         "sampler": args.sampler,
+        **(_isolated_identity(args) if args.sampler.startswith("isolated-") else {}),
+        "extra_deploy_args": args.extra_deploy_arg,
         **({"paraflow_core": _paraflow_core_identity()} if args.sampler == "joint-paraflow" else {}),
         "diagnostic": args.diagnostic,
         "replicas_per_gpu": args.replicas_per_gpu,

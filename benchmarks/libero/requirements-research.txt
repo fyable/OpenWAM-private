@@ -1,0 +1,9 @@
+robosuite==1.4.0
+bddl==1.0.1
+mujoco==3.3.2
+gym==0.25.2
+cloudpickle==2.1.0
+easydict==1.9
+matplotlib==3.10.9
+termcolor==3.3.0
+future==0.18.2

@@ -11,9 +11,9 @@ import numpy as np
 METHODS = ("native_n10_e8", "native_n4_e8", "joint_n4_e8")
 
 
-def summarize_root(root):
+def summarize_root(root, methods=METHODS):
     report = {}
-    for name in METHODS:
+    for name in methods:
         directory = root / name
         summary_path = directory / "summary.json"
         manifest_path = directory / "manifest.json"
@@ -24,13 +24,17 @@ def summarize_root(root):
         manifest = json.loads(manifest_path.read_text())
         overall = summary["overall"]
         diagnostic = manifest.get("diagnostic", False)
-        expected = 20 if diagnostic else 2000
+        signature = manifest.get("resume_signature", {})
+        trial_run = manifest.get("trial_run", {})
+        expected = (signature["jobs_count"] * trial_run["num_trials"]
+                    if "jobs_count" in signature and "num_trials" in trial_run
+                    else (20 if diagnostic else 2000))
         complete = (not summary["missing_runs"] and overall["trials"] == expected
                     and overall["tasks_complete"] == overall["tasks_expected"])
         row = {"status": "complete" if complete else "incomplete", "diagnostic": diagnostic,
                "overall": overall, "suites": summary["suite_results"],
                "protocol": {key: manifest.get(key) for key in
-                            ("checkpoint", "sampler", "denoise_steps", "inference_horizon", "effective_seed")}}
+                            ("checkpoint", "sampler", "denoise_steps", "inference_horizon", "effective_seed", "extra_deploy_args")}}
         requests = []
         for path in sorted((directory / "logs" / "servers").glob("*.log")):
             for line in path.open(errors="replace"):
@@ -52,16 +56,28 @@ def summarize_root(root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--methods", nargs="+", default=METHODS)
     args = parser.parse_args()
     if not args.root.is_dir():
         raise FileNotFoundError(args.root)
-    report = summarize_root(args.root)
+    report = summarize_root(args.root, args.methods)
     for name, row in report.items():
         overall = row.get("overall")
         result = "no results" if overall is None else (
             f"{overall['successes']}/{overall['trials']} ({overall['success_rate']:.2%})")
         print(f"{name:20s} {row['status']:10s} {result}")
     (args.root / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
+    lines = ["# LIBERO closed-loop comparison", "", "| Method | Status | Successes / Trials | Success rate |",
+             "|---|---|---:|---:|"]
+    for name, row in report.items():
+        overall = row.get("overall")
+        if overall is None:
+            lines.append(f"| {name} | {row['status']} | — | — |")
+        else:
+            lines.append(f"| {name} | {row['status']} | {overall['successes']} / {overall['trials']} | {overall['success_rate']:.2%} |")
+    lines += ["", "Diagnostic runs are small-sample checks, not full benchmark results.",
+              "Closed-loop request timings are not paired latency measurements; use replay for speed comparisons."]
+    (args.root / "comparison.md").write_text("\n".join(lines) + "\n")
     print("Closed-loop timings are not paired speedup measurements; use replay for speed comparisons.")
     if any(row["status"] != "complete" for row in report.values()):
         raise SystemExit(1)

@@ -151,25 +151,46 @@ def test_scopes_restore_methods_on_failure():
     assert video.prepare is prepare
 
 
-@pytest.mark.parametrize("batch_mismatch", [False, True])
-def test_paired_replay_complete_with_cpu_fake_engine(tmp_path, monkeypatch, batch_mismatch):
+@pytest.mark.parametrize("preset,mismatch_width,corrupt_shared,history_scope", [
+    ("default", 0, False, "phase_video_action"), ("default", 4, False, "phase_video_action"),
+    ("native-parallel", 0, False, "phase_video_action"),
+    ("native-parallel", 4, False, "phase_video_action"), ("native-parallel", 10, False, "phase_video_action"),
+    ("native-parallel", 0, True, "phase_video_action"),
+    ("native-parallel", 0, False, "action_only"), ("native-parallel", 10, False, "action_only"),
+    ("native-parallel", 0, True, "action_only"),
+])
+def test_paired_replay_complete_with_cpu_fake_engine(tmp_path, monkeypatch, preset, mismatch_width, corrupt_shared, history_scope):
     import torch
     from benchmarks.libero import joint_experiment as experiment
     from openwam.deploy.parallel_joint import JointParaFlowSampler
+
+    if corrupt_shared:
+        original_sample = JointParaFlowSampler.sample
+
+        def corrupt_sample(self, architecture, inputs, noise, schedule, *args, **kwargs):
+            result = original_sample(self, architecture, inputs, noise, schedule, *args, **kwargs)
+            if self.share_conditions and len(schedule) == 11:
+                self.history = self.history + 1
+            return result
+
+        monkeypatch.setattr(JointParaFlowSampler, "sample", corrupt_sample)
 
     class Architecture:
         dtype = torch.float32
         video_scheduler = SimpleNamespace(num_train_timesteps=1000)
         action_scheduler = SimpleNamespace(num_train_timesteps=1000)
 
+        def named_modules(self):
+            return []
+
         def forward(self, actions, action_time, *, latents, timestep, context, proprio, first_frame_latents):
-            offset = 0.5 if batch_mismatch and len(actions) == 4 else 0
+            offset = 0.5 if len(actions) == mismatch_width else 0
             return latents * 0.01 + timestep.reshape(-1, 1, 1, 1, 1) / 1000 + offset, actions * 0.02
 
     class Engine:
         def __init__(self):
             self.architecture = Architecture()
-            self._joint_sampler = JointParaFlowSampler()
+            self._joint_sampler = JointParaFlowSampler(history_scope=history_scope)
             self.cfg = SimpleNamespace(inference=SimpleNamespace(denoise_steps=4))
 
         def reset(self):
@@ -220,27 +241,51 @@ def test_paired_replay_complete_with_cpu_fake_engine(tmp_path, monkeypatch, batc
              states=np.zeros((5, 10)), prompts=np.array(["task"] * 5),
              episode_starts=np.array([True, False, False, False, False]))
     args = experiment.parser().parse_args(["replay-worker", "--trace", str(path), "--output", str(tmp_path),
-                                          "--device", "cpu", "--warmup", "0", "--measure", "3"])
-    if batch_mismatch:
+                                          "--device", "cpu", "--warmup", "0", "--measure", "3", "--preset", preset,
+                                          "--history-scope", history_scope])
+    if mismatch_width:
         with pytest.raises(RuntimeError, match="parity failed"):
             experiment.replay(args)
         failure = json.loads((tmp_path / "parity.json").read_text())
         assert failure["status"] == "failed"
-        assert failure["partitions"][0]["modalities"]["video"]["passed"] is False
-        assert failure["partitions"][0]["modalities"]["action"]["passed"] is True
+        failed_stage = failure["by_stages"][str(mismatch_width)]
+        assert failed_stage["partitions"][0]["modalities"]["video"]["passed"] is False
+        assert failed_stage["partitions"][0]["modalities"]["action"]["passed"] is True
         assert not (tmp_path / "requests.jsonl").exists()
         args.allow_parity_failure = True
+    if corrupt_shared:
+        args.allow_parity_failure = True
+        with pytest.raises(RuntimeError, match="N10 condition sharing trajectory parity failed"):
+            experiment.replay(args)
+        failure = json.loads((tmp_path / "condition_parity_failure.json").read_text())
+        assert failure["stages"] == 10
+        assert not (tmp_path / "timing.json").exists()
+        return
     report = experiment.replay(args)
     assert report["measured_indices"] == [2, 3, 4]
+    assert report["history_scope"] == history_scope
     assert report["cache_trajectory_parity"]["status"] == "passed"
-    assert report["numerical_equivalence_validated"] is not batch_mismatch
+    assert report["numerical_equivalence_validated"] is (preset == "default" and not mismatch_width)
     assert set(report["stage_batch_parity"]["microbenchmarks"]) == {"batch1", "batch2", "batch4"}
     assert all(result["wall_ms"]["count"] == 3 for result in report["methods"].values())
     rows = [json.loads(line) for line in (tmp_path / "requests.jsonl").read_text().splitlines()]
-    assert len(rows) == 25
+    methods = experiment.COMPARISON_METHODS if preset == "native-parallel" else experiment.METHODS
+    assert len(rows) == 5 * len(methods)
+    assert report["condition_trajectory_parity"]["status"] == "passed"
     assert len(next(row for row in rows if row["method"] == "native_n10")["forward_shapes"]) == 10
     experiment.report_markdown(tmp_path)
-    assert "joint_cached_n4" in (tmp_path / "comparison.md").read_text()
+    markdown = (tmp_path / "comparison.md").read_text()
+    if preset == "native-parallel":
+        assert set(report["methods"]) == set(experiment.COMPARISON_REPORTED)
+        assert report["stage_batch_parity"]["by_stages"]["10"]["status"] == ("failed" if mismatch_width == 10 else "passed")
+        assert len(report["condition_trajectory_parity"]["requests"]) == 10
+        assert all(row["reference_only"] == (row["method"] not in experiment.COMPARISON_REPORTED) for row in rows)
+        assert "joint_shared_n10" in markdown and "P50 speedup" in markdown
+        assert report["paired"]["native_n10"]["native_n10_speedup"]["p50"] == 1.0
+        assert {row["forward_shapes"][-1]["action"][0] for row in rows
+                if row["method"] == "joint_shared_n10" and row["measured"]} == {10}
+    else:
+        assert "joint_cached_n4" in markdown
 
 
 def test_tensor_error_reports_mismatches_and_nonfinite():
@@ -254,6 +299,56 @@ def test_tensor_error_reports_mismatches_and_nonfinite():
     result = tensor_error(torch.tensor([float("nan")]), torch.zeros(1))
     assert not result["finite"]
     json.dumps(result, allow_nan=False)
+
+
+def test_comparison_launcher_forwards_settings(tmp_path):
+    import os
+    import subprocess
+    from benchmarks.libero.joint_experiment import ROOT
+
+    env = dict(os.environ, GPU="7", OUT=str(tmp_path / "out"), TRACE=str(tmp_path / "trace.npz"),
+               SERVER_PYTHON="/bin/echo", WARMUP="3", MEASURE="5")
+    result = subprocess.run(["bash", str(ROOT / "scripts/compare_joint_native_parallel.sh")],
+                            env=env, capture_output=True, text=True, check=True)
+    assert "--preset native-parallel --require-exclusive" in result.stdout
+    assert "--skip-profile" in result.stdout
+    assert "--warmup 3 --measure 5" in result.stdout
+    assert str(tmp_path / "out") in result.stdout
+    assert not (tmp_path / "out").exists()
+
+
+def test_comparison_worker_forwards_preset(tmp_path, monkeypatch):
+    from benchmarks.libero import joint_experiment as experiment
+    from benchmarks.utils import owned_processes
+
+    captured = []
+    monkeypatch.setattr(owned_processes, "spawn_resource",
+                        lambda command, **kwargs: captured.append(command) or SimpleNamespace(wait=lambda: 0))
+    monkeypatch.setattr(owned_processes, "ProcessRegistry", lambda: SimpleNamespace(
+        add=lambda process: None, terminate_all=lambda: None))
+    args = experiment.parser().parse_args([
+        "timing", "--output", str(tmp_path), "--trace", str(tmp_path / "trace.npz"),
+        "--preset", "native-parallel", "--require-exclusive", "--allow-parity-failure",
+        "--action-tail-init", "endpoint_bridge", "--video-tail-init", "endpoint_bridge"])
+    experiment.run_worker(args, "replay-worker")
+    command = captured[0]
+    assert command[command.index("--preset") + 1] == "native-parallel"
+    assert "--require-exclusive" in command and "--allow-parity-failure" in command
+    assert command[command.index("--action-tail-init") + 1] == "endpoint_bridge"
+    assert command[command.index("--video-tail-init") + 1] == "endpoint_bridge"
+
+
+def test_exclusive_gpu_rejects_foreign_context(monkeypatch):
+    import os
+    from benchmarks.libero import joint_experiment as experiment
+
+    monkeypatch.setattr(experiment.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        stdout=f"GPU-target, {os.getpid()}\nGPU-other, 999999\n"))
+    experiment.require_exclusive_uuid("GPU-target")
+    monkeypatch.setattr(experiment.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        stdout="GPU-target, 999999\n"))
+    with pytest.raises(RuntimeError, match="Exclusive GPU timing rejected"):
+        experiment.require_exclusive_uuid("GPU-target")
 
 
 def test_capture_child_assembly_and_cleanup(tmp_path):

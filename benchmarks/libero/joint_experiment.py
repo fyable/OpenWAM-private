@@ -24,7 +24,14 @@ METHODS = {
     "native_n10": ("native", 10, False),
     "joint_n4": ("joint-paraflow", 4, False),
     "joint_cached_n4": ("joint-paraflow", 4, True),
+    "joint_shared_n4": ("joint-paraflow", 4, True),
 }
+COMPARISON_METHODS = {
+    **{name: METHODS[name] for name in ("native_n10", "joint_n4", "joint_cached_n4", "joint_shared_n4")},
+    "joint_n10": ("joint-paraflow", 10, False),
+    "joint_shared_n10": ("joint-paraflow", 10, True),
+}
+COMPARISON_REPORTED = ("native_n10", "joint_shared_n10", "joint_shared_n4")
 
 
 def write_json(path, data):
@@ -51,8 +58,8 @@ def selected_indices(observations, warmup, measure):
                      "collect more real observations or lower WARMUP/MEASURE explicitly")
 
 
-def method_order(index, seed=42):
-    names = list(METHODS)
+def method_order(index, seed=42, methods=None):
+    names = list(METHODS if methods is None else methods)
     random.Random(seed + index).shuffle(names)
     return names
 
@@ -81,6 +88,11 @@ def require_exclusive_device(device):
     import torch
 
     uuid = str(torch.cuda.get_device_properties(device).uuid).removeprefix("GPU-")
+    require_exclusive_uuid(uuid)
+
+
+def require_exclusive_uuid(uuid):
+    uuid = uuid.strip().removeprefix("GPU-")
     result = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
                             capture_output=True, text=True, timeout=10, check=True)
     foreign = [line for line in result.stdout.splitlines() if line.split(",")[0].strip().removeprefix("GPU-") == uuid
@@ -152,6 +164,9 @@ def build_engine(args):
         "inference.sampler": "joint-paraflow", "inference.denoise_steps": 4,
         "inference.inference_horizon": 8, "inference.inference_mode": "sync",
         "inference.denoise_mode": "sync", "optimization.compile.enabled": False,
+        "inference.joint_history_scope": args.history_scope,
+        "inference.joint_action_tail_init": args.action_tail_init,
+        "inference.joint_video_tail_init": args.video_tail_init,
         "optimization.dit_cache.enabled": False, "optimization.decode_video": False,
     }
     for key, value in settings.items():
@@ -183,7 +198,7 @@ def tensor_error(actual, expected, *, rtol=0.05, atol=0.05):
                                  torch.linalg.vector_norm(expected).clamp_min(1e-12))}
 
 
-def check_stage_batch(engine, conditions, *, rtol=0.05, atol=0.05, micro_warmup=5, micro_measure=20):
+def check_stage_batch(engine, conditions, *, rtol=0.05, atol=0.05, micro_warmup=5, micro_measure=20, stages=4):
     import torch
 
     original = engine.architecture.forward
@@ -192,7 +207,7 @@ def check_stage_batch(engine, conditions, *, rtol=0.05, atol=0.05, micro_warmup=
     def checked(actions, *positional, **keywords):
         prediction = original(actions, *positional, **keywords)
         batch = len(actions)
-        if batch == 4 and result["status"] == "not_run":
+        if batch == stages and result["status"] == "not_run":
             partitions = []
             for width in (1, 2):
                 def sliced(value, index):
@@ -217,7 +232,7 @@ def check_stage_batch(engine, conditions, *, rtol=0.05, atol=0.05, micro_warmup=
                               reason="nonfinite_predictions")
                 return prediction
             microbenchmarks = {}
-            for width in (1, 2, 4):
+            for width in (1, 2, stages):
                 def sliced(value, index):
                     return value[index:index + width] if torch.is_tensor(value) and value.ndim and value.shape[0] == batch else value
 
@@ -260,7 +275,7 @@ def check_stage_batch(engine, conditions, *, rtol=0.05, atol=0.05, micro_warmup=
         engine.architecture.forward = original
         engine.reset()
     if result["status"] == "not_run":
-        raise RuntimeError("No warm batch4 was available for parity verification")
+        raise RuntimeError(f"No warm batch{stages} was available for parity verification")
     return result
 
 
@@ -272,36 +287,50 @@ def replay(args):
     from benchmarks.libero.replay_joint import load_observations
 
     observations = load_observations(args.trace)
+    comparison = args.preset == "native-parallel"
+    methods = COMPARISON_METHODS if comparison else METHODS
+    reported = COMPARISON_REPORTED if comparison else tuple(methods)
     selected = selected_indices(observations, args.warmup, args.measure)
     chosen = set(selected)
-    engine, checkpoint = build_engine(args)
     if args.require_exclusive:
         require_exclusive_device(args.device)
+    engine, checkpoint = build_engine(args)
     hardware_before = hardware_snapshot()
     conditions = [{"first_frame_image": [Image.fromarray(image)], "prompt": str(prompt),
                    "proprio": state, "seed": 42}
                   for image, prompt, state in zip(*observations[:3])]
-    parity = check_stage_batch(engine, conditions, micro_warmup=args.micro_warmup,
-                               micro_measure=args.micro_measure)
+    parity_by_stages = {}
+    for stages in ((4, 10) if comparison else (4,)):
+        engine.cfg.inference.denoise_steps = stages
+        parity_by_stages[str(stages)] = check_stage_batch(
+            engine, conditions, micro_warmup=args.micro_warmup,
+            micro_measure=args.micro_measure, stages=stages)
+    parity = dict(parity_by_stages["4"])
+    parity["by_stages"] = parity_by_stages
+    parity["status"] = "passed" if all(value["status"] == "passed" for value in parity_by_stages.values()) else "failed"
     write_json(args.output / "parity.json", parity)
     if parity["status"] != "passed":
-        finite = all(value["finite"] for partition in parity["partitions"]
-                     for value in partition["modalities"].values())
+        finite = all(value["finite"] for check in parity_by_stages.values()
+                     for partition in check["partitions"] for value in partition["modalities"].values())
         if not args.allow_parity_failure or not finite:
             raise RuntimeError("Stage-batch parity failed; full video/action diagnostics saved to parity.json. "
                                "Thresholds are unchanged. Use --allow-parity-failure only for a labeled "
                                "performance diagnostic, not an equivalence claim.")
         print("[joint-experiment] WARNING: stage-batch parity FAILED; continuing diagnostic timings only", flush=True)
     states = {}
-    for name, (sampler, _, cached) in METHODS.items():
+    for name, (sampler, _, cached) in methods.items():
         states[name] = {
-            "sampler": JointParaFlowSampler(cache_schedule=cached) if sampler != "native" else None,
+            "sampler": JointParaFlowSampler(cache_schedule=cached, share_conditions=name.startswith("joint_shared_"),
+                                             history_scope=args.history_scope, action_tail_init=args.action_tail_init,
+                                             video_tail_init=args.video_tail_init) if sampler != "native" else None,
             "prompt_cache": _BoundedPromptEmbedCache(), "vace_cache": {},
             "cpu_rng": torch.random.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state(args.device),
         }
-    rows = {name: [] for name in METHODS}
+    rows = {name: [] for name in methods}
     partition_rows = []
+    shared_partition_rows = []
     forward_shapes = []
+    forward_events = []
     original_forward = engine.architecture.forward
     prep_peak = 0
     prep_reserved = 0
@@ -317,7 +346,12 @@ def replay(args):
                                "action_tokens_per_stage": actions.shape[1],
                                "joint_tokens_per_stage": video_tokens + actions.shape[1] if video_tokens else None})
         with torch.profiler.record_function("joint.forward"):
-            return original_forward(actions, *positional, **keywords)
+            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            begin.record(torch.cuda.current_stream(args.device))
+            prediction = original_forward(actions, *positional, **keywords)
+            end.record(torch.cuda.current_stream(args.device))
+            forward_events.append((begin, end))
+            return prediction
 
     engine.architecture.forward = counted
     previous_prompt = None
@@ -342,18 +376,19 @@ def replay(args):
                 if args.require_exclusive and index % 10 == 0:
                     require_exclusive_device(args.device)
                 reset = bool(observations[3][index]) or conditions[index]["prompt"] != previous_prompt
-                order = method_order(index)
+                order = method_order(index, methods=methods)
                 for position, name in enumerate(order):
                     state = states[name]
                     engine._joint_sampler = state["sampler"]
                     engine._prompt_embed_cache = state["prompt_cache"]
                     engine._vace_cache = state["vace_cache"]
-                    engine.cfg.inference.denoise_steps = METHODS[name][1]
+                    engine.cfg.inference.denoise_steps = methods[name][1]
                     if reset:
                         engine.reset()
                     torch.random.set_rng_state(state["cpu_rng"])
                     torch.cuda.set_rng_state(state["cuda_rng"], args.device)
                     forward_shapes.clear()
+                    forward_events.clear()
                     prep_peak = 0
                     prep_reserved = 0
                     torch.cuda.synchronize(args.device)
@@ -365,14 +400,18 @@ def replay(args):
                     end.record(torch.cuda.current_stream(args.device))
                     torch.cuda.synchronize(args.device)
                     elapsed = (time.perf_counter() - started) * 1000
+                    if not bool(torch.isfinite(torch.as_tensor(result["actions"])).all()):
+                        raise FloatingPointError(f"Non-finite output actions: {name}, request {index}")
                     stats = result.get("sampler_stats")
                     if index in chosen and stats and stats["cold"]:
                         raise RuntimeError(f"Unexpected cold Joint request at paired index {index}")
                     state["cpu_rng"] = torch.random.get_rng_state()
                     state["cuda_rng"] = torch.cuda.get_rng_state(args.device)
                     row = {"index": index, "method": name, "order_position": position,
-                           "measured": index in chosen, "reset": reset, "wall_ms": elapsed,
+                           "measured": index in chosen, "reference_only": name not in reported,
+                           "reset": reset, "wall_ms": elapsed,
                            "cuda_event_ms": begin.elapsed_time(end), "forward_shapes": list(forward_shapes),
+                           "denoise_forward_span_ms": forward_events[0][0].elapsed_time(forward_events[-1][1]) if forward_events else None,
                            "peak_allocated_bytes": max(prep_peak, torch.cuda.max_memory_allocated(args.device)),
                            "peak_reserved_bytes": max(prep_reserved, torch.cuda.max_memory_reserved(args.device)),
                            "free_bytes": torch.cuda.mem_get_info(args.device)[0], "sampler_stats": stats}
@@ -404,6 +443,35 @@ def replay(args):
                     raise RuntimeError("Cached trajectory parity failed; see cache_parity_failure.json. "
                                        "No thresholds were relaxed.")
                 partition_rows.append({"index": index, "max_absolute_error": max(errors)})
+                shared = states["joint_shared_n4"]["sampler"]
+                shared_diagnostics = {
+                    "action_history": tensor_error(shared.history, base.history),
+                    **{f"video_phase_{key}": tensor_error(shared.video_phases[key], base.video_phases[key])
+                       for key in base.video_phases},
+                }
+                if not all(value["passed"] for value in shared_diagnostics.values()):
+                    write_json(args.output / "condition_parity_failure.json",
+                               {"status": "failed", "index": index, "rtol": 0.05, "atol": 0.05,
+                                "trajectories": shared_diagnostics})
+                    raise RuntimeError("Condition sharing trajectory parity failed; see condition_parity_failure.json. "
+                                       "ALLOW_PARITY_FAILURE does not bypass this gate.")
+                shared_partition_rows.append({"index": index, "max_absolute_error": max(
+                    value["max_absolute_error"] for value in shared_diagnostics.values())})
+                if comparison:
+                    base_n10 = states["joint_n10"]["sampler"]
+                    shared_n10 = states["joint_shared_n10"]["sampler"]
+                    diagnostics_n10 = {
+                        "action_history": tensor_error(shared_n10.history, base_n10.history),
+                        **{f"video_phase_{key}": tensor_error(shared_n10.video_phases[key], base_n10.video_phases[key])
+                           for key in base_n10.video_phases},
+                    }
+                    if not all(value["passed"] for value in diagnostics_n10.values()):
+                        write_json(args.output / "condition_parity_failure.json",
+                                   {"status": "failed", "index": index, "stages": 10,
+                                    "trajectories": diagnostics_n10})
+                        raise RuntimeError("N10 condition sharing trajectory parity failed; cannot bypass this gate")
+                    shared_partition_rows.append({"index": index, "stages": 10, "max_absolute_error": max(
+                        value["max_absolute_error"] for value in diagnostics_n10.values())})
                 previous_prompt = conditions[index]["prompt"]
                 if index % 10 == 0 or index == selected[-1]:
                     print(f"[joint-experiment] replay {index + 1}/{selected[-1] + 1}", flush=True)
@@ -413,15 +481,22 @@ def replay(args):
             sampler.sample = original
     summary = {}
     for name, requests in rows.items():
+        if name not in reported:
+            continue
         measured = [row for row in requests if row["measured"]]
         summary[name] = {"wall_ms": percentiles([row["wall_ms"] for row in measured]),
+                         "stages": methods[name][1],
+                         "denoise_forward_span_ms": percentiles([row["denoise_forward_span_ms"] for row in measured
+                                                                 if row["denoise_forward_span_ms"] is not None]),
+                         "denoise_ms": percentiles([row["sampler_stats"]["denoise_ms"] for row in measured
+                                                     if row["sampler_stats"] and "denoise_ms" in row["sampler_stats"]]),
                          "cuda_event_ms": percentiles([row["cuda_event_ms"] for row in measured]),
                          "peak_allocated_gib": max(row["peak_allocated_bytes"] for row in measured) / 2**30,
                          "cold_wall_ms": percentiles([row["wall_ms"] for row in requests
                                                       if row["sampler_stats"] and row["sampler_stats"]["cold"]])}
     paired = {}
     baseline = [rows["native_n10"][index]["wall_ms"] for index in selected]
-    for name in METHODS:
+    for name in reported:
         values = [rows[name][index]["wall_ms"] for index in selected]
         paired[name] = {"native_n10_speedup": percentiles([base / value for base, value in zip(baseline, values)]),
                         "native_n10_minus_method_ms": percentiles([base - value for base, value in zip(baseline, values)])}
@@ -429,9 +504,17 @@ def replay(args):
     if args.require_exclusive:
         require_exclusive_device(args.device)
     report = {"status": "completed", "measurement_status": "complete", "timing_valid": True,
-              "numerical_equivalence_validated": parity["status"] == "passed",
-              "interpretation": "validated_comparison" if parity["status"] == "passed" else "performance_diagnostic_only_parity_failed",
+              "numerical_equivalence_validated": False if comparison else parity["status"] == "passed",
+              "interpretation": ("batch_and_condition_checks_passed_not_policy_equivalence" if comparison else "validated_comparison")
+                                if parity["status"] == "passed" else "performance_diagnostic_only_parity_failed",
               "protocol": "single_loaded_model_per_observation_seeded_interleaving",
+              "preset": args.preset, "method_configs": methods,
+              "history_scope": args.history_scope,
+              "action_tail_init": args.action_tail_init, "video_tail_init": args.video_tail_init,
+              "equivalence_boundary": "batch partition and shared conditions only; no native-versus-parallel policy equivalence",
+              "video_latent_denoising": True, "video_pixel_decode": False,
+              "denoise_forward_span_boundary": "CUDA interval from first joint forward start to last forward end; includes intervening solver/host gaps, excludes final solver update",
+              "reference_methods": [name for name in methods if name not in reported],
               "warmup": args.warmup, "measure": args.measure, "measured_indices": selected,
               "trace": str(args.trace.resolve()), "trace_sha256": hashlib.sha256(args.trace.read_bytes()).hexdigest(),
               "checkpoint": str(Path(args.ckpt_dir) / checkpoint), "core_identity": core_identity(),
@@ -443,8 +526,11 @@ def replay(args):
               "methods": summary, "paired": paired, "stage_batch_parity": parity,
               "cache_trajectory_parity": {"status": "passed", "rtol": 0.05, "atol": 0.05,
                                           "requests": partition_rows},
+              "condition_trajectory_parity": {"status": "passed", "rtol": 0.05, "atol": 0.05,
+                                              "requests": shared_partition_rows},
               "timing_boundary": "composed RGB + proprio to engine action result; excludes camera composition/simulator",
-              "closed_loop": "not_run", "architectural_fastpaths": "not_implemented"}
+              "closed_loop": "not_run", "architectural_fastpaths": {
+                  name: "cached_schedule_and_shared_stage_conditions" for name in reported if name.startswith("joint_shared_")}}
     write_json(args.output / "timing.json", report)
     return report
 
@@ -515,6 +601,7 @@ def capture(args):
 def report_markdown(output):
     report = json.loads((output / "timing.json").read_text())
     lines = ["# Joint performance experiment", "", f"Protocol: `{report['protocol']}`; same real observation indices.",
+             f"History scope: `{report.get('history_scope', 'phase_video_action')}`; future video latent prediction remains enabled.",
              "", "| Method | Requests | Wall P50 ms | Wall P95 ms | CUDA event P50 ms | Peak allocated GiB |",
              "|---|---:|---:|---:|---:|---:|"]
     for name, result in report["methods"].items():
@@ -526,7 +613,8 @@ def report_markdown(output):
               "", "Timing excludes simulator/camera composition. CUDA event intervals may include GPU idle time;",
               "use the separate profiler for operator attribution. This replay does not measure success rate.",
               "Native N1 is a latency reference, not evidence of equivalent policy quality.",
-              "Prepared conditioning, prefix prefill, CUDA Graph and multi-GPU are not enabled.",
+              "joint_shared_n4 shares identical stage conditioning projections; its trajectory parity is mandatory.",
+              "Cross-request conditioning caches, prefix prefill, CUDA Graph and multi-GPU are not enabled.",
               "", "See `timing.json` for paired speedups, cold starts, hashes and hardware metadata;",
               "`requests.jsonl` contains every request, order, shape and memory sample."]
     lines += ["", "## Frozen-stage microbenchmarks", "",
@@ -534,6 +622,26 @@ def report_markdown(output):
               "| Stage batch | Calls | Wall P50 ms | CUDA event P50 ms |", "|---|---:|---:|---:|"]
     for name, values in report["stage_batch_parity"].get("microbenchmarks", {}).items():
         lines.append(f"| {name} | {values['calls']} | {values['wall_ms']['p50']:.3f} | {values['cuda_event_ms']['p50']:.3f} |")
+    if report.get("preset") == "native-parallel":
+        baseline = report["methods"]["native_n10"]["wall_ms"]["p50"]
+        lines += ["", "## Native N10 versus parallel Joint", "",
+                  "All methods denoise future video latents; VAE pixel decoding is disabled. H32/E8, same checkpoint and trace.",
+                  "N10 compares equal stage counts, not equal algorithms or outputs. N4 also reduces stage count.",
+                  "Batch-partition checks do not establish native-versus-parallel policy equivalence; closed-loop success rate is not measured.",
+                  "Reference-only unshared trajectories run outside reported requests' timing intervals; they remain resident in memory.",
+                  "", "| Method | Stages | Wall P50 ms | Wall P95 ms | CUDA P50 ms | Forward span P50 ms | Peak GiB | P50 speedup |",
+                  "|---|---:|---:|---:|---:|---:|---:|---:|"]
+        for name, values in report["methods"].items():
+            span = values["denoise_forward_span_ms"]
+            span_text = f"{span['p50']:.3f}" if span else "not_run"
+            lines.append(f"| {name} | {values['stages']} | {values['wall_ms']['p50']:.3f} | "
+                         f"{values['wall_ms']['p95']:.3f} | {values['cuda_event_ms']['p50']:.3f} | "
+                         f"{span_text} | {values['peak_allocated_gib']:.3f} | {baseline / values['wall_ms']['p50']:.3f}x |")
+        lines += ["", "Forward span: first denoising forward start to last forward end, including intervening gaps, excluding final solver update.",
+                  "Sampler-only denoise_ms (where available) and paired per-request speedups are in timing.json.",
+                  "", "| Stages | Batch partition parity |", "|---|---|"]
+        for stages, check in report["stage_batch_parity"]["by_stages"].items():
+            lines.append(f"| {stages} | {check['status']} |")
     if (output / "profile.json").is_file():
         profile_data = json.loads((output / "profile.json").read_text())
         lines += ["", "## Separate Profiler", "", "Observed attention events:", "",
@@ -551,6 +659,7 @@ def profile(args):
     observations = load_observations(args.trace)
     selected = selected_indices(observations, 0, min(3, args.measure))
     engine, _ = build_engine(args)
+    engine._joint_sampler.share_conditions = True
     with scoped_annotations(engine.architecture), torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         record_shapes=True, profile_memory=True) as profiler:
@@ -569,6 +678,7 @@ def profile(args):
                         for term in ("scaled_dot_product", "flash", "fmha", "efficient_attention"))})
     operators = sorted(averages, key=lambda event: event.self_device_time_total, reverse=True)[:50]
     write_json(args.output / "profile.json", {"status": "completed", "timing_valid": False,
+               "method": "joint_shared_n4", "cache_schedule": engine._joint_sampler.cache_schedule,
                                               "trace": "joint_trace.json", "operators": "operators.txt",
                                               "attention_events": attention,
                                               "top_operators": [{"name": event.key, "count": event.count,
@@ -600,6 +710,10 @@ def parser():
     result.add_argument("--allow-parity-failure", action="store_true",
                         help="Explicitly continue finite batch mismatches for labeled performance diagnostics only")
     result.add_argument("--require-exclusive", action="store_true")
+    result.add_argument("--preset", choices=("default", "native-parallel"), default="default")
+    result.add_argument("--history-scope", choices=("phase_video_action", "action_only"), default="phase_video_action")
+    for modality in ("action", "video"):
+        result.add_argument(f"--{modality}-tail-init", choices=("stage_residual", "endpoint_bridge"), default="stage_residual")
     return result
 
 
@@ -612,6 +726,12 @@ def main(argv=None):
     if args.trace:
         args.trace = args.trace.resolve()
     if args.mode == "plan":
+        if args.preset == "native-parallel":
+            print("Optional real E8 capture -> N4/N10 stage-batch checks -> single-model interleaved "
+                  "Native N10 + parallel cached/shared N10/N4, with independent unshared reference trajectories "
+                  "-> JSON/Markdown report. Includes future video latent denoising, excludes pixel decoding "
+                  "and closed-loop success rate.")
+            return
         print("Collect real E8 requests if TRACE is absent -> stage partition parity -> single-model interleaved "
               "Native N1/N4/N10 + Joint N4/cached -> separate profiler -> JSON/Markdown report. "
               "No closed-loop accuracy campaign. Explicit GPU selection is your responsibility.")
@@ -636,10 +756,18 @@ def main(argv=None):
                 raise FileExistsError(f"Refusing to overwrite existing experiment artifact: {name}")
         manifest = {"status": "running", "mode": args.mode, "benchmark": args.benchmark,
                     "trace_source": "provided" if args.trace else "automatic_closed_loop_capture",
-                    "warmup": args.warmup, "measure": args.measure, "closed_loop_accuracy": "not_run"}
+                    "warmup": args.warmup, "measure": args.measure, "preset": args.preset,
+                    "closed_loop_accuracy": "not_run"}
         write_json(args.output / "experiment.json", manifest)
         try:
             if args.mode in ("all", "capture") and args.trace is None:
+                if args.require_exclusive:
+                    target = subprocess.run(["nvidia-smi", "-i", args.gpu, "--query-gpu=uuid", "--format=csv,noheader"],
+                                            capture_output=True, text=True, timeout=10, check=True)
+                    uuid = target.stdout.strip()
+                    if not uuid or len(uuid.splitlines()) != 1:
+                        raise RuntimeError("Exclusive capture requires exactly one physical GPU")
+                    require_exclusive_uuid(uuid)
                 manifest["stage"] = "capture"
                 write_json(args.output / "experiment.json", manifest)
                 args.trace = args.output / "observations.npz"
@@ -673,6 +801,9 @@ def run_worker(args, mode):
                "--output", str(args.output), "--trace", str(args.trace), "--ckpt-dir", str(args.ckpt_dir),
                "--device", args.device, "--warmup", str(args.warmup), "--measure", str(args.measure)]
     command.extend(["--micro-warmup", str(args.micro_warmup), "--micro-measure", str(args.micro_measure)])
+    command.extend(["--preset", args.preset, "--benchmark", args.benchmark])
+    command.extend(["--history-scope", args.history_scope])
+    command.extend(["--action-tail-init", args.action_tail_init, "--video-tail-init", args.video_tail_init])
     if args.allow_parity_failure:
         command.append("--allow-parity-failure")
     if args.require_exclusive:

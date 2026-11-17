@@ -1,0 +1,9 @@
+{
+  "layer_ids": [0],
+  "step_ids": [0],
+  "query_modality": "action",
+  "source_modality": "future_video",
+  "kind": "gate",
+  "gate": 0.0,
+  "chunk_size": 32
+}

@@ -10,7 +10,7 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-MODES = ("eager", "cuda_graph", "model_fused", "model_deep", "model_deep_tuned")
+MODES = ("cuda_graph", "model_fused", "model_deep", "model_deep_tuned")
 SHARED = Path("/data2/jikangye/research/runs/paraflow/hardware-ablation-20261017/wam-port")
 
 
@@ -20,6 +20,23 @@ def save(path, value):
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def default_options():
+    return {
+        "checkpoint": str(SHARED / "assets/openwam"),
+        "observation": str(SHARED / "original-options/openwam-observation.npz"),
+        "operators": {"plan": "portable", "refine_graph": True, "gpu_pixels": True, "early_vae": True},
+    }
+
+
+def mode_options(options, mode):
+    if mode not in MODES:
+        raise ValueError(f"Unsupported isolated OpenWAM mode: {mode}; choose from {MODES}")
+    operators = dict(options.get("operators", {})) if mode == "model_deep_tuned" else {
+        "plan": "portable", "refine_graph": False, "gpu_pixels": False, "early_vae": False,
+    }
+    return dict(options, mode=mode, operators=operators)
 
 
 def original_command(python, options, output, *, warmup, samples, steps):
@@ -34,7 +51,9 @@ def summarize(output):
              "Different checkpoint, attention semantics and input/return boundaries prohibit cross-panel speedup claims.",
              "Original ParaFlow execution modes below are current API modes, not the historical cumulative C1-C5 rows.", "",
              "## Original ParaFlow: first-frame / isolated", "",
-             "| Mode | N | Samples | P50 ms | P95 ms | Eager-relative P50 ratio |", "|---|---:|---:|---:|---:|---:|"]
+             "cuda_graph is an accelerated reference, NOT eager or the historical 110 ms baseline.", "",
+             "Operator plans are recorded explicitly; portable is not the historical accepted fixed-kernel plan.", "",
+             "| Mode | Plan | N | Samples | P50 ms | P95 ms | CUDA-graph-relative P50 ratio |", "|---|---|---:|---:|---:|---:|---:|"]
     records = {}
     for mode in MODES:
         path = output / f"paraflow_{mode}.json"
@@ -44,9 +63,11 @@ def summarize(output):
                 for row in receipt["results"]:
                     records[mode, row["steps"]] = row
     for (mode, steps), row in records.items():
-        reference = records.get(("eager", steps))
+        reference = records.get(("cuda_graph", steps))
         ratio = f"{reference['median_ms'] / row['median_ms']:.3f}" if reference else "not_run"
-        lines.append(f"| {mode} | {steps} | {len(row['samples_ms'])} | {row['median_ms']:.3f} | {row['p95_ms']:.3f} | {ratio} |")
+        options_path = output / f"options_{mode}.json"
+        plan = json.loads(options_path.read_text()).get("operators", {}).get("plan", "portable") if options_path.exists() else "unknown"
+        lines.append(f"| {mode} | {plan} | {steps} | {len(row['samples_ms'])} | {row['median_ms']:.3f} | {row['p95_ms']:.3f} | {ratio} |")
     lines += ["", "## Current Joint: full future-video / mutual", "",
               "| Method | Samples | P50 ms | P95 ms |", "|---|---:|---:|---:|"]
     path = output / "joint" / "timing.json"
@@ -74,7 +95,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     output = Path(os.environ.get("COMPARE_ROOT", f"outputs/joint_original_paraflow_{time.strftime('%Y%m%d_%H%M%S')}" )).resolve()
     if args.mode == "plan":
-        print("Original ParaFlow official replay: eager/cuda_graph/model_fused/model_deep/model_deep_tuned, N4 and N10, H32/E8.")
+        print("Original ParaFlow official replay: cuda_graph/model_fused/model_deep/model_deep_tuned, N4 and N10, H32/E8.")
+        print("Isolated OpenWAM does not support eager; ratios use cuda_graph, not the historical 110 ms baseline.")
+        print("Default operator plan: portable. Historical accepted kernels require an exact library/runtime match; opt in via PF_OPTIONS.")
         print("Then current full-mutual Joint replay; grouped report, no cross-semantics speedup ratio.")
         print("Required: TRACE. Original PF runtime/checkpoint/observation default to the local read-only shared wam-port installation.")
         print("Overrides: PF_PYTHON, PF_NATIVE_ROOT, PF_OPTIONS (official factory JSON).")
@@ -99,11 +122,8 @@ def main(argv=None):
             raise FileNotFoundError(path)
     if native == ROOT:
         raise ValueError("PF_NATIVE_ROOT must point to the original-compatible native runtime, not this Joint checkout")
-    options = json.loads(options_path.read_text()) if options_path else {
-        "checkpoint": str(SHARED / "assets/openwam"),
-        "observation": str(SHARED / "original-options/openwam-observation.npz"),
-        "operators": {"plan": "accepted", "refine_graph": True, "gpu_pixels": True, "early_vae": True},
-    }
+    options = json.loads(options_path.read_text()) if options_path else default_options()
+    print(f"Requested tuned operator configuration: {json.dumps(options.get('operators', {}), sort_keys=True)}", flush=True)
     for key in ("checkpoint", "observation"):
         path = Path(options[key]).expanduser()
         if not path.is_absolute() or not path.exists():
@@ -112,8 +132,8 @@ def main(argv=None):
     if not weight.is_file():
         raise FileNotFoundError(weight)
     modes = os.environ.get("PF_MODES", ",".join(MODES)).split(",")
-    if len(set(modes)) != len(modes) or any(mode not in MODES for mode in modes) or "eager" not in modes:
-        raise ValueError("PF_MODES must contain unique supported modes including eager")
+    if len(set(modes)) != len(modes) or any(mode not in MODES for mode in modes) or "cuda_graph" not in modes:
+        raise ValueError("PF_MODES must contain unique isolated OpenWAM modes including cuda_graph; eager is unsupported")
     steps = [int(value) for value in os.environ.get("PF_STEPS", "4,10").split(",")]
     if len(set(steps)) != len(steps) or any(value < 2 for value in steps):
         raise ValueError("PF_STEPS must contain unique N>=2 values")
@@ -148,11 +168,14 @@ def main(argv=None):
         process = spawn_resource(command, cwd=cwd, env=environment, stdout=log)
         registry.add(process, log)
         if process.wait() != 0:
+            log.flush()
+            tail = (output / log_name).read_text(errors="replace").splitlines()[-35:]
+            print("\n".join(tail), file=sys.stderr, flush=True)
             raise RuntimeError(f"Experiment failed: see {output / log_name}")
 
     try:
         for mode in modes:
-            local = dict(options, mode=mode)
+            local = mode_options(options, mode)
             local_path = output / f"options_{mode}.json"
             save(local_path, local)
             run(original_command(python, local_path, output / f"paraflow_{mode}.json", warmup=48, samples=120, steps=steps),
