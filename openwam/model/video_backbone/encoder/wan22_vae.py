@@ -72,8 +72,11 @@ def _find_vae_file(model_path: str) -> str:
     return uniq[0]
 
 
-def _preprocess_image(image: Image.Image, *, dtype, device, min_value=-1.0, max_value=1.0) -> Tensor:
-    arr = torch.tensor(np.array(image, dtype=np.float32), dtype=dtype, device=device)
+def _preprocess_image(image: Image.Image, *, dtype, device, min_value=-1.0, max_value=1.0, pin_memory=False) -> Tensor:
+    arr = torch.from_numpy(np.array(image, dtype=np.float32))
+    if pin_memory and torch.device(device).type == "cuda":
+        arr = arr.pin_memory()
+    arr = arr.to(dtype=dtype, device=device, non_blocking=arr.is_pinned())
     arr = arr * ((max_value - min_value) / 255.0) + min_value
     return repeat(arr, "H W C -> B C H W", B=1)
 
@@ -114,10 +117,10 @@ class WanVideoVAEEncoder(VideoEncoder):
     def properties(self) -> VideoEncoderProperties:
         return self._spec
 
-    def preprocess_video(self, frames) -> Tensor:
+    def preprocess_video(self, frames, *, pin_memory=False) -> Tensor:
         dtype = next(self._m.parameters()).dtype
         device = next(self._m.parameters()).device
-        images = [_preprocess_image(img, dtype=dtype, device=device, min_value=-1.0, max_value=1.0) for img in frames]
+        images = [_preprocess_image(img, dtype=dtype, device=device, pin_memory=pin_memory) for img in frames]
         return torch.stack(images, dim=2)
 
     def batch_encode(self, video: Tensor) -> Tensor:

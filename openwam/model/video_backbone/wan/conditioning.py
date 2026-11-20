@@ -91,7 +91,7 @@ def build_deploy_i2v_y(
     return y
 
 
-def finalize_ti2v_first_frame_latents(inputs_shared: dict, first_frame_image, *, is_ti2v, encoder, vae, dtype, device):
+def finalize_ti2v_first_frame_latents(inputs_shared: dict, first_frame_image, *, is_ti2v, encoder, vae, dtype, device, pin_memory=False):
     """Emit ``first_frame_latents`` for TI2V deploy: its ``seperated_timestep``
     DiT needs both ``fuse_vae_embedding_in_latents=True`` AND ``first_frame_latents``
     so frame-0 tokens get t=0 and base.generate can clean-replace ``latents[:, :, 0:1]``.
@@ -106,7 +106,9 @@ def finalize_ti2v_first_frame_latents(inputs_shared: dict, first_frame_image, *,
     inputs_shared["fuse_vae_embedding_in_latents"] = True
     inputs_shared["num_clean_prefix_frames"] = 0
     ref_frames = first_frame_image if isinstance(first_frame_image, list) else [first_frame_image]
-    ref_tensor = wan_encode.preprocess_video(ref_frames, encoder=encoder, dtype=dtype, device=device)
+    ref_tensor = wan_encode.preprocess_video(
+        ref_frames, encoder=encoder, dtype=dtype, device=device, pin_memory=pin_memory
+    )
     ref_image_latents = wan_encode.encode_video(ref_tensor.to(device), vae=vae, encoder=encoder).to(
         dtype=dtype, device=device
     )

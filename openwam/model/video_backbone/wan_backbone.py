@@ -965,19 +965,20 @@ class WanBase(VideoBackbone):
 
         # Deploy ``input_video`` is always None, so ``latents`` == ``noise``
         # (same tensor under both keys, as base.generate expects).
-        noise = wan_conditioning.build_deploy_noise(
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            seed=seed,
-            rand_device="cpu",
-            latent_spec=self._latent_spec,
-            vae=self.vae,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        inputs_shared["noise"] = noise
-        inputs_shared["latents"] = noise
+        if (initial_latents := kw.get("initial_latents")) is None:
+            initial_latents = wan_conditioning.build_deploy_noise(
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                seed=seed,
+                rand_device="cpu",
+                latent_spec=self._latent_spec,
+                vae=self.vae,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            inputs_shared["noise"] = initial_latents
+        inputs_shared["latents"] = initial_latents
 
         # I2V first-frame: CLIP + VAE ``y``, each gated on the DiT flags.
         # ``resolve_i2v_input_image`` is None for non-I2V backbones.
@@ -1037,6 +1038,7 @@ class WanBase(VideoBackbone):
             vae=self.vae,
             dtype=self.dtype,
             device=self.device,
+            pin_memory=kw.get("pin_first_frame", False),
         )
         return inputs_shared
 

@@ -225,9 +225,11 @@ class PolicyServer:
         self._total_latency = 0.0
 
     def shutdown(self):
-        """Clean up async resources."""
+        """Clean up inference workers."""
         if self._policy is not None:
             self._policy.shutdown()
+        elif callable(shutdown_engine := getattr(self.engine, "shutdown", None)):
+            shutdown_engine()
 
     def run(self, host: str = "0.0.0.0", port: int = 8848):
         """Start the WebSocket policy server.
@@ -307,7 +309,10 @@ class PolicyServer:
                 await asyncio.Future()  # run forever
 
         logger.info("Starting PolicyServer: ws://%s:%d", host, port)
-        asyncio.run(serve())
+        try:
+            asyncio.run(serve())
+        finally:
+            self.shutdown()
 
 
 def merge_deploy_cfg(training_cfg, deploy_cfg):
@@ -360,7 +365,26 @@ def build_server_from_config(
     _normalize_compile_enabled_in_cfg(deploy_cfg)
     training_cfg, architecture = load_from_checkpoint_dir(ckpt_dir, device=device, ckpt_name=ckpt_name)
     merged = merge_deploy_cfg(training_cfg, deploy_cfg)
-    engine = JointInferenceEngine(cfg=merged, architecture=architecture)
+    chunk_models = None
+    if getattr(merged.inference, "sampler", "native") == "chunk-pipeline":
+        import torch
+
+        devices = getattr(merged.inference, "chunk_devices", None) or [device]
+        devices = [torch.device(value) for value in devices]
+        if any(item.type != "cuda" for item in devices):
+            raise ValueError("chunk_devices accepts only CUDA devices")
+        devices = [torch.device("cuda", item.index if item.index is not None else 0) for item in devices]
+        primary = torch.device(device)
+        if (len(devices) not in (1, 4) or len(set(devices)) != len(devices)
+                or primary.type != "cuda" or devices[0].index != (primary.index or 0)
+                or any(item.index >= torch.cuda.device_count() for item in devices)):
+            raise ValueError("chunk_devices requires one or four distinct visible CUDA devices, primary device first")
+        chunk_models = [architecture]
+        for worker_device in devices[1:]:
+            with torch.cuda.device(worker_device):
+                _, model = load_from_checkpoint_dir(ckpt_dir, device=str(worker_device), ckpt_name=ckpt_name)
+            chunk_models.append(model)
+    engine = JointInferenceEngine(cfg=merged, architecture=architecture, chunk_models=chunk_models)
     from openwam.deploy.request_trace import attach_request_trace
 
     attach_request_trace(engine)
@@ -473,10 +497,14 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--readiness-token", help=argparse.SUPPRESS)
     parser.add_argument(
         "--sampler",
-        choices=("native", "joint-paraflow", "isolated-native", "isolated-paraflow"),
+        choices=("native", "chunk-pipeline", "joint-paraflow", "isolated-native", "isolated-paraflow"),
         default=None,
         help="Experimental joint-paraflow requires H32/E8, sync mode and compile disabled.",
     )
+    parser.add_argument("--chunk-devices", type=lambda value: value.split(","), metavar="DEVICES",
+                        help="Comma-separated CUDA devices, with --device first.")
+    parser.add_argument("--chunk-speculative-steps", type=int, choices=(2, 3),
+                        help="Speculative Joint steps per interval. Defaults to 3.")
     parser.add_argument(
         "--denoise-steps",
         type=int,
@@ -602,6 +630,9 @@ def _apply_inference_overrides(cfg, args):
 
     if getattr(args, "sampler", None) is not None:
         OmegaConf.update(cfg, "inference.sampler", args.sampler, merge=False)
+    for key in ("chunk_devices", "chunk_speculative_steps"):
+        if getattr(args, key, None) is not None:
+            OmegaConf.update(cfg, f"inference.{key}", getattr(args, key), merge=False)
     if args.denoise_steps is not None:
         OmegaConf.update(cfg, "inference.denoise_steps", args.denoise_steps, merge=False)
     if args.denoise_mode is not None:

@@ -82,7 +82,12 @@ class WAMPolicy:
 
     def shutdown(self):
         """Release executor resources (background threads in async mode)."""
-        self._executor.shutdown()
+        try:
+            self._executor.shutdown()
+        finally:
+            shutdown_engine = getattr(self.engine, "shutdown", None)
+            if callable(shutdown_engine):
+                shutdown_engine()
 
     def _build_conditions(self, obs: dict) -> dict:
         """Assemble inference conditions from the current observation.

@@ -185,9 +185,12 @@ def collect(args):
                                 image_transform=cfg.get("image_transform", "rotate_180"),
                                 state_dim=int(cfg.get("state_dim", 10)))
     try:
-        for task_record in split["tasks"]:
-            if task_record["split"] != args.selected_split:
-                continue
+        tasks = [task for task in split["tasks"] if task["split"] == args.selected_split]
+        shard_count = getattr(args, "task_shard_count", 1)
+        shard_index = getattr(args, "task_shard_index", 0)
+        if not 0 <= shard_index < shard_count:
+            raise ValueError("Invalid collection task shard")
+        for task_record in tasks[shard_index::shard_count]:
             task_suite = benchmark.get_benchmark_dict()[task_record["suite"]]()
             task = task_suite.get_task(task_record["task_id"])
             if task.name != task_record["task_name"]:

@@ -115,7 +115,11 @@ def task_smoke(suite: str, task_id: int) -> None:
 def _check_egl_runtime() -> None:
     if os.environ.get("MUJOCO_GL", "egl").lower() != "egl":
         return
-    candidates = [Path(path) for path in glob("/usr/lib*/**/libEGL_nvidia.so*", recursive=True)]
+    # Avoid walking all of /usr/lib recursively: distro library symlinks can
+    # create cycles, turning a small runtime check into an unbounded scan.
+    patterns = ("/usr/lib*/libEGL_nvidia.so*", "/usr/lib*/*-linux-gnu/libEGL_nvidia.so*",
+                "/usr/lib*/nvidia*/libEGL_nvidia.so*", "/usr/lib*/*-linux-gnu/nvidia*/libEGL_nvidia.so*")
+    candidates = [Path(path) for pattern in patterns for path in glob(pattern)]
     if candidates and not any(path.is_file() and path.stat().st_size > 0 for path in candidates):
         joined = ", ".join(str(path) for path in candidates)
         raise SystemExit(

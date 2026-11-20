@@ -484,6 +484,8 @@ def _resume_signature(
         "denoise_mode": args.denoise_mode,
         "denoise_steps": args.denoise_steps,
         "sampler": getattr(args, "sampler", "native"),
+        **({"chunk_pipeline_gpus": len(args.gpus), "chunk_speculative_steps": args.chunk_speculative_steps}
+           if getattr(args, "sampler", "native") == "chunk-pipeline" else {}),
         **(_isolated_identity(args) if str(getattr(args, "sampler", "native")).startswith("isolated-") else {}),
         **({"joint_optimization_overrides": [value for value in args.extra_deploy_arg
                                             if value.startswith(("inference.joint_cache_schedule=", "inference.joint_share_conditions=", "inference.joint_history_scope=", "inference.joint_action_tail_init=", "inference.joint_video_tail_init="))]}
@@ -853,6 +855,10 @@ def _server_command(args: argparse.Namespace, port: int) -> list[str]:
         command.extend(("--compile-enabled", args.compile_enabled))
     if getattr(args, "sampler", "native") != "native":
         command.extend(("--sampler", args.sampler))
+    if getattr(args, "sampler", "native") == "chunk-pipeline":
+        command.extend(("--chunk-devices", ",".join(f"cuda:{i}" for i in range(len(args.gpus))),
+                        "--chunk-speculative-steps", str(args.chunk_speculative_steps),
+                        "--compile-enabled", "false", "optimization.dit_cache.enabled=false"))
     command.extend(args.extra_deploy_arg)
     return command
 
@@ -874,7 +880,8 @@ def _start_servers(
         log_handle.write(f"command: {shlex.join(command)}\n")
         log_handle.flush()
         env = dict(os.environ)
-        env.update({"CUDA_VISIBLE_DEVICES": str(slot.gpu), "PYTHONUNBUFFERED": "1"})
+        visible = ",".join(map(str, args.gpus)) if getattr(args, "sampler", "native") == "chunk-pipeline" else str(slot.gpu)
+        env.update({"CUDA_VISIBLE_DEVICES": visible, "PYTHONUNBUFFERED": "1"})
         process = subprocess.Popen(
             command,
             cwd=REPO_ROOT,
@@ -1172,7 +1179,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the seed in policy_config.yml for every task environment",
     )
-    parser.add_argument("--sampler", choices=("native", "joint-paraflow", "isolated-native", "isolated-paraflow"), default="native")
+    parser.add_argument("--sampler", choices=("native", "chunk-pipeline", "joint-paraflow", "isolated-native", "isolated-paraflow"), default="native")
+    parser.add_argument("--chunk-speculative-steps", type=int, choices=(2, 3), default=3)
     parser.add_argument("--diagnostic", action="store_true", help="Non-canonical five-trial-per-task diagnostic run")
     parser.add_argument("--denoise-steps", type=int, default=10)
     parser.add_argument("--denoise-mode", choices=("sync", "async"), default="sync")
@@ -1291,7 +1299,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"rebalancing {len(assignment_jobs)} unfinished task(s)",
                 flush=True,
             )
-    slots = _build_replica_slots(args.gpus, args.base_port, args.replicas_per_gpu)
+    if args.sampler == "chunk-pipeline":
+        if len(args.gpus) not in (1, 4) or args.replicas_per_gpu != 1:
+            raise ValueError("chunk-pipeline requires one or four GPUs and --replicas-per-gpu 1")
+        slots = _build_replica_slots(args.gpus[:1], args.base_port, 1)
+    else:
+        slots = _build_replica_slots(args.gpus, args.base_port, args.replicas_per_gpu)
     pull_order = sorted(slots, key=lambda slot: (slot.replica, slot.gpu_slot))
     active_slots = pull_order[: min(len(pull_order), len(assignment_jobs))]
     _print_plan(args, jobs, assignment_jobs, slots, active_slots, trial_run, mujoco_version)
