@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import types
 from pathlib import Path
@@ -466,6 +467,9 @@ def _install_manifest(module) -> None:
         progress_path = Path(os.environ["ROBOTWIN_PROGRESS_FILE"])
 
         args["eval_mode"] = True
+        if os.environ.get("OPENWAM_BENCH_TIMING") == "1":
+            args["eval_video_log"] = False
+            args.pop("eval_video_save_dir", None)
         task_env.suc = 0
         task_env.test_num = 0
         while len(accepted) < test_num:
@@ -560,8 +564,12 @@ def _install_eval(module) -> None:
         task_env.suc = 0
         task_env.test_num = 0
         args["eval_mode"] = True
+        if os.environ.get("OPENWAM_BENCH_TIMING") == "1":
+            args["eval_video_log"] = False
+            args.pop("eval_video_save_dir", None)
         try:
             for entry in entries:
+                episode_started = time.perf_counter()
                 episode = entry["episode"]
                 seed = entry["seed"]
                 domain = GlobalRngDomain.from_seed(seed)
@@ -604,6 +612,10 @@ def _install_eval(module) -> None:
                     task_env._set_eval_video_ffmpeg(ffmpeg)
 
                 reset_func(model)
+                if os.environ.get("OPENWAM_BENCH_TIMING") == "1":
+                    model._bench_policy_ms = 0.0
+                    model._bench_env_ms = 0.0
+                rollout_started = time.perf_counter()
                 success = False
                 while task_env.take_action_cnt < task_env.step_lim:
                     with domain.activate():
@@ -612,6 +624,8 @@ def _install_eval(module) -> None:
                     if task_env.eval_success:
                         success = True
                         break
+                rollout_ms = (time.perf_counter() - rollout_started) * 1000
+                policy_steps = int(task_env.take_action_cnt)
                 if task_env.eval_video_path is not None:
                     task_env._del_eval_video_ffmpeg()
                 if success:
@@ -627,6 +641,10 @@ def _install_eval(module) -> None:
                         "seed": seed,
                         "instruction": entry["instructions"][selected_type],
                         "success": success,
+                        **({"episode_ms": (time.perf_counter() - episode_started) * 1000,
+                            "rollout_ms": rollout_ms, "policy_steps": policy_steps,
+                            "policy_ms": model._bench_policy_ms, "env_ms": model._bench_env_ms}
+                           if os.environ.get("OPENWAM_BENCH_TIMING") == "1" else {}),
                     }
                 )
                 write_progress(

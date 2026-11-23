@@ -60,8 +60,13 @@ def test_make_env_does_not_retry_unrelated_error(monkeypatch):
     assert attempts == 1
 
 
-def test_ordinary_entry_keeps_native_result_schema(tmp_path, monkeypatch):
+@pytest.mark.parametrize('state_hash', [False, True])
+def test_ordinary_entry_keeps_native_result_schema(tmp_path, monkeypatch, state_hash):
     single_eval = _load_single_eval(monkeypatch)
+    if state_hash:
+        monkeypatch.setenv('OPENWAM_LIBERO_STATE_HASH', '1')
+    else:
+        monkeypatch.delenv('OPENWAM_LIBERO_STATE_HASH', raising=False)
     monkeypatch.setattr(single_eval, "_write_libero_config", lambda: None)
 
     task = types.SimpleNamespace(name="task", language="instruction")
@@ -71,7 +76,7 @@ def test_ordinary_entry_keeps_native_result_schema(tmp_path, monkeypatch):
             return task
 
         def get_task_init_states(self, task_id):
-            return [object()]
+            return [single_eval.np.array([1., 2., 3.])]
 
     libero_module = types.ModuleType("libero.libero")
     libero_module.benchmark = types.SimpleNamespace(get_benchmark_dict=lambda: {"libero_spatial": Suite})
@@ -145,4 +150,8 @@ def test_ordinary_entry_keeps_native_result_schema(tmp_path, monkeypatch):
         "seed",
         "trials",
     }
-    assert set(result["trials"][0]) == {"trial", "success", "policy_steps", "last_reward"}
+    expected = {"trial", "success", "policy_steps", "last_reward"}
+    if state_hash:
+        expected.add('init_state_sha256')
+        assert len(result['trials'][0]['init_state_sha256']) == 64
+    assert set(result["trials"][0]) == expected

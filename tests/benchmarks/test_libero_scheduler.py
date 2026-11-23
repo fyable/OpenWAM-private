@@ -43,6 +43,25 @@ def test_unfinished_jobs_preserves_only_missing_jobs(tmp_path):
     assert _unfinished_jobs(tmp_path, jobs, trial_run) == [jobs[0], jobs[2]]
 
 
+def test_chunk_resume_identity_tracks_optimization_flags(tmp_path, monkeypatch):
+    policy = tmp_path / 'policy.yml'
+    policy.write_text('seed: 42\n')
+    checkpoint = tmp_path / 'checkpoint'
+    checkpoint.write_text('weights')
+    args = SimpleNamespace(policy_config=policy, seed=42, ckpt_dir=tmp_path, ckpt_name='checkpoint',
+                           inference_mode='sync', inference_horizon=8, denoise_mode='sync', denoise_steps=10,
+                           sampler='chunk-pipeline', gpus=[0, 2, 4, 6], chunk_speculative_steps=3,
+                           extra_deploy_arg=[], render_gpus=[0])
+    monkeypatch.setenv('OPENWAM_CHUNK_CUDA_GRAPH', '0')
+    baseline = scheduler._resume_signature(args, jobs=[TaskJob('libero_goal', 0)],
+                                           trial_run=TrialRun(0, 5), mujoco_version='test')
+    monkeypatch.setenv('OPENWAM_CHUNK_CUDA_GRAPH', '1')
+    candidate = scheduler._resume_signature(args, jobs=[TaskJob('libero_goal', 0)],
+                                            trial_run=TrialRun(0, 5), mujoco_version='test')
+    assert baseline != candidate
+    assert candidate['chunk_optimization_flags']['OPENWAM_CHUNK_CUDA_GRAPH'] == '1'
+
+
 def test_unfinished_jobs_ignores_malformed_results(tmp_path):
     job = TaskJob("libero_object", 7)
     trial_run = TrialRun(trial_start=5, num_trials=2)

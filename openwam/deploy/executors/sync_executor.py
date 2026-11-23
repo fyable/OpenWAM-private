@@ -17,6 +17,7 @@ from typing import Optional
 import numpy as np
 
 from openwam.deploy.engine import BaseInferenceEngine
+from openwam import chunk_diagnostics as diagnostics
 
 
 class SyncInferenceExecutor:
@@ -42,6 +43,7 @@ class SyncInferenceExecutor:
 
     def predict_action(self, conditions: dict) -> np.ndarray:
         """Pop the next action, regenerating after the configured horizon."""
+        diagnostics.mark('action_buffer', cache_hit=bool(self._action_buffer))
         if len(self._action_buffer) == 0:
             self._generate_and_enqueue(conditions)
 

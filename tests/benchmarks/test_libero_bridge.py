@@ -99,3 +99,25 @@ def test_native_eef10_bridge_clips_runtime_command_directly() -> None:
 def test_policy_rejects_wrong_representation() -> None:
     with pytest.raises(RuntimeError, match="representation mismatch"):
         OpenWAMLiberoPolicy(_client=_Client("wrong_contract"))
+
+
+def test_optional_client_timing_preserves_action(monkeypatch, capsys):
+    import json
+
+    class Client(_Client):
+        def reset(self):
+            return {"type": "reset_ack"}
+
+        def predict(self, payload):
+            return {"action": [0, 0, 0, 1, 0, 0, 0, 1, 0, 1]}
+
+    monkeypatch.setenv("OPENWAM_LIBERO_REQUEST_TIMING", "1")
+    policy = OpenWAMLiberoPolicy(_client=Client("eef"), send_state=False, left_wrist_camera_key=None)
+    policy.reset()
+    action = policy.act({"agentview_image": np.zeros((16, 16, 3), dtype=np.uint8)}, "test")
+    line = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("[CLIENT_TIMING] "))
+    timing = json.loads(line.split(" ", 1)[1])
+    assert timing["episode"] == 0
+    assert timing["step"] == 0
+    assert timing["observation_to_action_ms"] >= 0
+    np.testing.assert_array_equal(action, [0, 0, 0, 0, 0, 0, -1])

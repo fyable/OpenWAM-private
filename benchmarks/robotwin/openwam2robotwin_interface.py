@@ -327,6 +327,7 @@ class ModelClient:
         Returns:
             action: np.ndarray, shape (action_dim,)
         """
+        started = time.perf_counter()
         cams = example["cams"]
         instruction = str(example.get("lang", self._task_description))
 
@@ -361,9 +362,22 @@ class ModelClient:
             prompt=prompt,
             state=state_list,
         )
+        payload_ready = time.perf_counter()
         response = self._client.predict(payload)
+        response_ready = time.perf_counter()
         action = np.array(response["action"], dtype=np.float32)
 
+        if os.environ.get("OPENWAM_BENCH_TIMING") == "1":
+            print("[BENCH_REQUEST] " + json.dumps({
+                "episode": self._episode,
+                "step": self._step,
+                "kind": "inference" if self._step % 8 == 0 else "cached",
+                "phase": "first" if self._step == 0 else ("warmup" if self._step < 24 else "steady"),
+                "client_ms": (response_ready - started) * 1000,
+                "transport_ms": (response_ready - payload_ready) * 1000,
+                "server_ms": response.get("latency_ms"),
+            }), flush=True)
+            self._bench_policy_ms = getattr(self, "_bench_policy_ms", 0.0) + (response_ready - started) * 1000
         self._step += 1
         if self._debug:
             self._save_debug_step(cams, prompt, state_list, response)
@@ -459,5 +473,8 @@ def eval(TASK_ENV, model: ModelClient, observation: dict) -> None:
         action = action_conversion.eef20d_to_ee16d(action)
 
     context = nullcontext() if _BENCHMARK_RNG_DOMAIN is None else _BENCHMARK_RNG_DOMAIN.activate()
+    action_started = time.perf_counter()
     with context:
         TASK_ENV.take_action(action, action_type=model._action_type)
+    if os.environ.get("OPENWAM_BENCH_TIMING") == "1":
+        model._bench_env_ms = getattr(model, "_bench_env_ms", 0.0) + (time.perf_counter() - action_started) * 1000

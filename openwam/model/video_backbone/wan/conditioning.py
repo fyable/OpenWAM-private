@@ -16,6 +16,8 @@ import torch
 from einops import rearrange
 from torch import Tensor
 
+from openwam.chunk_diagnostics import mark, profiled
+
 from openwam.model.video_backbone.wan import encode as wan_encode
 from openwam.model.video_backbone.wan.preprocess import generate_noise, preprocess_image
 
@@ -50,6 +52,7 @@ def build_deploy_noise(*, height, width, num_frames, seed, rand_device, latent_s
     return generate_noise(shape, seed=seed, rand_device=rand_device, dtype=dtype, device=device)
 
 
+@profiled('condition_i2v_clip')
 def build_deploy_i2v_clip(input_image, *, height, width, dit, image_encoder, dtype, device) -> Optional[Tensor]:
     """I2V CLIP feature (replaces ImageEmbedderCLIP); None if the DiT/encoder gate fails."""
     if image_encoder is None or not dit.require_clip_embedding:
@@ -59,6 +62,7 @@ def build_deploy_i2v_clip(input_image, *, height, width, dit, image_encoder, dty
     return clip_context.to(dtype=dtype, device=device)
 
 
+@profiled('condition_i2v_y')
 def build_deploy_i2v_y(
     input_image, *, num_frames, height, width, tiled, tile_size, tile_stride, dit, vae, dtype, device
 ) -> Optional[Tensor]:
@@ -91,12 +95,14 @@ def build_deploy_i2v_y(
     return y
 
 
+@profiled('condition_ti2v')
 def finalize_ti2v_first_frame_latents(inputs_shared: dict, first_frame_image, *, is_ti2v, encoder, vae, dtype, device):
     """Emit ``first_frame_latents`` for TI2V deploy: its ``seperated_timestep``
     DiT needs both ``fuse_vae_embedding_in_latents=True`` AND ``first_frame_latents``
     so frame-0 tokens get t=0 and base.generate can clean-replace ``latents[:, :, 0:1]``.
     VACE/I2V skip this — their first-frame rides ``vace_context`` / ``y``.
     """
+    mark('condition_applicability', family='ti2v', applicable=bool(is_ti2v and first_frame_image is not None))
     if not is_ti2v or first_frame_image is None:
         if first_frame_image is None:
             inputs_shared.pop("first_frame_latents", None)
@@ -278,6 +284,7 @@ def build_vace_context_from_pixels(
     return torch.cat([vace_video_latents, vace_mask_latents], dim=1)
 
 
+@profiled('condition_vace')
 def build_vace_context_for_deploy(
     inputs_shared: dict, first_frame_image, vace_video, *, has_vace, vae, encoder, dtype, device
 ) -> None:

@@ -837,6 +837,16 @@ class WanBase(VideoBackbone):
         )
         return wan_encode.latents_to_frames(video_tensor, encoder=self.video_encoder)
 
+    def decode_selected_video_frames(self, latents: Tensor, *, indices, tiled: bool = True) -> list:
+        if self.video_encoder is not None:
+            frames = self.decode_video(latents, tiled=tiled)
+            return [frames[index] for index in indices]
+        video_tensor = wan_encode.decode_latents(
+            latents, vae=self.vae, encoder=None, device=self.device, tiled=tiled)
+        if video_tensor.shape[2] != 9:
+            raise RuntimeError('Expected full nine-frame VAE decode')
+        return wan_encode.latents_to_frames(video_tensor[:, :, list(indices)], encoder=None)
+
     # ================================================================
     # Self-contained checkpoint: specs into config + artifacts into dir
     # ================================================================
@@ -965,17 +975,20 @@ class WanBase(VideoBackbone):
 
         # Deploy ``input_video`` is always None, so ``latents`` == ``noise``
         # (same tensor under both keys, as base.generate expects).
-        noise = wan_conditioning.build_deploy_noise(
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            seed=seed,
-            rand_device="cpu",
-            latent_spec=self._latent_spec,
-            vae=self.vae,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        initial_latents = kw.get('initial_latents')
+        noise = initial_latents if os.environ.get('OPENWAM_CHUNK_REUSE_NOISE') == '1' and seed is not None else None
+        if noise is None:
+            noise = wan_conditioning.build_deploy_noise(
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                seed=seed,
+                rand_device="cpu",
+                latent_spec=self._latent_spec,
+                vae=self.vae,
+                dtype=self.dtype,
+                device=self.device,
+            )
         inputs_shared["noise"] = noise
         inputs_shared["latents"] = noise
 

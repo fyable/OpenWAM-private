@@ -12,6 +12,8 @@ from typing import Tuple
 import torch
 from torch import Tensor
 
+from openwam.chunk_diagnostics import mark, profiled
+
 from openwam.model.video_backbone.wan.preprocess import preprocess_video as _preprocess_video_native
 from openwam.model.video_backbone.wan.preprocess import vae_output_to_video
 
@@ -34,14 +36,18 @@ def encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Tens
     return context, seq_lens
 
 
+@profiled('text_condition')
 def encode_text_for_inference(
     prompt, *, vace_cache, prompt_embed_cache, tokenizer, text_encoder, device
 ) -> Tuple[Tensor, Tensor]:
     """Deploy ``(context, seq_lens)``, reusing a prompt-keyed cached embed."""
     if vace_cache and vace_cache.get("populated") and vace_cache.get("prompt_key") == prompt:
+        mark('text_cache', hit=True)
         return vace_cache["context"], vace_cache["seq_lens"]
     if prompt_embed_cache is not None and prompt in prompt_embed_cache:
+        mark('text_cache', hit=True)
         return prompt_embed_cache[prompt]
+    mark('text_cache', hit=False)
     context, seq_lens = encode_text([prompt], tokenizer=tokenizer, text_encoder=text_encoder, device=device)
     if prompt_embed_cache is not None:
         prompt_embed_cache[prompt] = (context, seq_lens)
@@ -54,12 +60,14 @@ def preprocess_video(frames, *, encoder=None, dtype, device) -> Tensor:
     return _preprocess_video_native(frames, dtype=dtype, device=device)
 
 
+@profiled('vae_encode')
 def encode_video(video_tensor: Tensor, *, vae, encoder=None) -> Tensor:
     if encoder is not None:
         return encoder.batch_encode(video_tensor)
     return vae.batch_encode(video_tensor, device=video_tensor.device)
 
 
+@profiled('vae_encode_vace')
 def encode_video_for_vace(
     pixels: Tensor,
     *,
@@ -95,12 +103,14 @@ def encode_video_for_vace(
     return torch.cat(outs, dim=0).to(dtype=pixels.dtype, device=pixels.device)
 
 
+@profiled('vae_decode')
 def decode_latents(latents: Tensor, *, vae, encoder=None, device, tiled: bool = True) -> Tensor:
     if encoder is not None:
         return encoder.decode(latents.to(device), tiled=tiled)
     return vae.decode(latents.to(device), device=device, tiled=tiled)
 
 
+@profiled('frames_materialize')
 def latents_to_frames(video_tensor: Tensor, *, encoder=None) -> list:
     if encoder is not None:
         return encoder.to_frames(video_tensor)

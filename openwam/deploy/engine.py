@@ -109,6 +109,7 @@ class JointInferenceEngine(BaseInferenceEngine):
         cfg,
         architecture: Optional[BaseWAMArchitecture] = None,
         action_backbone=None,
+        chunk_models=None,
     ):
         super().__init__(cfg, architecture=architecture, action_backbone=action_backbone)
         normalize_denoise_config(getattr(cfg, "inference", None))
@@ -119,9 +120,37 @@ class JointInferenceEngine(BaseInferenceEngine):
         self._init_optimizations()
         self._init_cfg()
         self._joint_sampler = None
+        self._chunk_pipeline = None
         sampler = getattr(cfg.inference, "sampler", "native")
-        if sampler not in ("native", "joint-paraflow", "isolated-native", "isolated-paraflow"):
+        if sampler not in ("native", "chunk-pipeline", "joint-paraflow", "isolated-native", "isolated-paraflow"):
             raise ValueError(f"Unknown inference sampler: {sampler}")
+        if sampler == "chunk-pipeline":
+            from openwam.deploy.chunk_pipeline import ChunkPipeline, ChunkWorker
+
+            inf = cfg.inference
+            if (type(architecture).__name__ != "DualSystemSelfAttnArchitecture"
+                    or cfg.model.video_backbone.name != "wan22_ti2v_5b"
+                    or cfg.model.architecture.attention_mask_mode != "mutual"
+                    or getattr(cfg.dataloader, "video_stride", None) != 4):
+                raise ValueError("chunk-pipeline requires Wan2.2 TI2V with mutual Joint attention and video stride 4")
+            if (getattr(inf, "inference_mode", "sync") != "sync" or inf.denoise_mode != "sync"
+                    or inf.inference_horizon != 8 or inf.denoise_steps != 10
+                    or inf.num_frames != 33 or inf.video_num_frames != 9):
+                raise ValueError("chunk-pipeline requires synchronous N10/H32/E8")
+            compile_cfg = getattr(getattr(cfg, "optimization", None), "compile", None)
+            if (self._cfg_scale != 1.0 or self._decode_video or self._dit_cache is not None
+                    or getattr(compile_cfg, "enabled", False)):
+                raise ValueError("chunk-pipeline requires eager inference, CFG=1, no DiT cache, and decode_video=false")
+            from copy import deepcopy
+
+            # The Wan preprocessor mutates its scheduler on the worker thread.
+            self._chunk_schedulers = tuple(deepcopy(scheduler) for scheduler in
+                                           (architecture.video_scheduler, architecture.action_scheduler))
+            self._chunk_pipeline = ChunkPipeline(
+                [model if hasattr(model, 'command') else ChunkWorker(model)
+                 for model in (chunk_models or [architecture])],
+                getattr(inf, "chunk_speculative_steps", 3),
+            )
         if sampler.startswith("isolated-"):
             from openwam.deploy.isolated_reference import IsolatedReferenceSampler, configure_isolated, DEFAULT_PARAFLOW, DEFAULT_NATIVE
 
@@ -180,6 +209,12 @@ class JointInferenceEngine(BaseInferenceEngine):
         sampler = getattr(self, "_joint_sampler", None)
         if sampler is not None:
             sampler.reset()
+        if getattr(self, "_chunk_pipeline", None) is not None:
+            self._chunk_pipeline.reset()
+
+    def shutdown(self):
+        if self._chunk_pipeline is not None:
+            self._chunk_pipeline.close()
 
     def _filter_architecture_generate_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Drop deploy-only kwargs the architecture's generate() cannot consume."""
@@ -343,6 +378,7 @@ class JointInferenceEngine(BaseInferenceEngine):
         Returns:
             dict with ``video`` (list of PIL images or None) and ``actions`` (numpy array).
         """
+        arrived = time.perf_counter()
         inf_cfg = self.cfg.inference
         research_context = conditions.get("research_context")
         if research_context is not None:
@@ -354,6 +390,7 @@ class JointInferenceEngine(BaseInferenceEngine):
                 raise TypeError("research_context must be an intervention object or ResearchContext")
             compile_cfg = getattr(getattr(self.cfg, "optimization", None), "compile", None)
             if (self._dit_cache is not None or getattr(self, "_joint_sampler", None) is not None
+                or getattr(self, "_chunk_pipeline", None) is not None
                 or bool(getattr(compile_cfg, "enabled", False))
                 or getattr(inf_cfg, "inference_mode", "sync") != "sync"
                 or conditions.get("denoise_mode", getattr(inf_cfg, "denoise_mode", "sync")) != "sync"
@@ -389,10 +426,12 @@ class JointInferenceEngine(BaseInferenceEngine):
             getattr(_vb, "shift_video", None) if _vb is not None else None,
         )
 
+        video_scheduler, action_scheduler = getattr(self, "_chunk_schedulers", None) or (
+            self.architecture.video_scheduler, self.architecture.action_scheduler)
         schedule = make_schedule(
             denoise_mode,
-            video_scheduler=self.architecture.video_scheduler,
-            action_scheduler=self.architecture.action_scheduler,
+            video_scheduler=video_scheduler,
+            action_scheduler=action_scheduler,
             num_steps=denoise_steps,
             shift=shift,
             shift_video=shift_video,
@@ -420,6 +459,28 @@ class JointInferenceEngine(BaseInferenceEngine):
                 getattr(inf_cfg, "video_num_frames", action_num_frames),
             )
         )
+
+        if getattr(self, "_chunk_pipeline", None) is not None:
+            first_frame = conditions.get("first_frame_image")
+            if (denoise_mode != "sync" or denoise_steps != 10 or action_num_frames != 33
+                    or video_num_frames != 9 or not isinstance(first_frame, (tuple, list)) or len(first_frame) != 1
+                    or (self.architecture.uses_proprioception and proprio is None)
+                    or conditions.get("input_video_latents") is not None or conditions.get("vace_video") is not None):
+                raise ValueError("chunk-pipeline requires N10/H32/E8 and one observed frame with native conditions")
+            schedule = tuple(tuple(float(value) for value in pair) for pair in schedule)
+            if (len(schedule) != 11 or schedule[-1] != (0.0, 0.0)
+                    or any(not (curr[0] > nxt[0] and curr[1] > nxt[1])
+                           for curr, nxt in zip(schedule, schedule[1:]))):
+                raise ValueError("chunk-pipeline requires ten strictly descending Joint steps")
+            result = self._chunk_pipeline.generate({
+                "first_frame_image": first_frame, "prompt": conditions.get("prompt", ""),
+                "proprio": proprio, "schedule": schedule, "shift": shift,
+                "height": conditions.get("height", getattr(inf_cfg, "height", 384)),
+                "width": conditions.get("width", getattr(inf_cfg, "width", 320)),
+                "seed": conditions.get("seed", 42), "tiled": conditions.get("tiled", True),
+            }, arrived=arrived)
+            logger.info("chunk-pipeline request stats=%s", result["sampler_stats"])
+            return result
 
         generate_kwargs = self._filter_architecture_generate_kwargs(
             {

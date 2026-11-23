@@ -1,0 +1,281 @@
+"""Overlapped H32/E8 inference with one resident Joint state per chunk."""
+
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from contextlib import nullcontext
+from dataclasses import dataclass, field
+from threading import Event, Lock
+from time import perf_counter
+
+import torch
+
+
+@dataclass
+class Chunk:
+    start: int
+    worker: int
+    stage: int = 0
+    video: torch.Tensor | None = None
+    action: torch.Tensor | None = None
+    inactive_noise: torch.Tensor | None = None
+    speculative_ms: float = 0.0
+    completed_at: list[float] = field(default_factory=list)
+
+
+class ChunkWorker:
+    def __init__(self, model):
+        self.model = model
+        self.prompt_cache = OrderedDict()
+
+    def prepare(self, chunk, request, image):
+        model = self.model
+        inputs = model.video_backbone.preprocess_input_for_inference(
+            prompt=request['prompt'], first_frame_image=image, num_frames=9,
+            height=request['height'], width=request['width'], seed=request['seed'],
+            num_inference_steps=10, shift=request['shift'], tiled=request['tiled'],
+            prompt_embed_cache=self.prompt_cache, pin_first_frame=True,
+            initial_latents=chunk.video,
+        )
+        if len(self.prompt_cache) > 32:
+            self.prompt_cache.popitem(last=False)
+        ref = inputs['first_frame_latents']
+        if chunk.video is None:
+            chunk.video = inputs['latents']
+            chunk.action = torch.randn(
+                (1, 32, model.action_dim), dtype=model.dtype, device=model.device,
+                generator=torch.Generator(device=model.device).manual_seed(request['seed']),
+            )
+        chunk.video[:, :, :ref.shape[2]] = ref
+        if model.uses_proprioception:
+            inputs['proprio'] = request['proprio'].to(device=model.device, dtype=model.dtype)
+        inputs.pop('latents')
+        inputs.pop('noise', None)
+        return inputs, model._resolve_inactive_action_dims(None, model.device)
+
+    def step(self, chunk, request, prepared):
+        model = self.model
+        inputs, inactive = prepared
+        index = chunk.stage
+        (tv, ta), (nv, na) = request['schedule'][index:index + 2]
+        train_v = float(model.video_scheduler.num_train_timesteps)
+        train_a = float(model.action_scheduler.num_train_timesteps)
+        dv = nv / train_v - tv / train_v
+        # The native sampler keeps masked dimensions on the analytic noise path.
+        if inactive is not None and chunk.inactive_noise is None:
+            chunk.inactive_noise = chunk.action[..., inactive].detach().clone() / (ta / train_a)
+        video_flow, action_flow = model.forward(
+            chunk.action, torch.tensor([ta], device=model.device, dtype=model.dtype),
+            **inputs, latents=chunk.video,
+            timestep=torch.tensor([tv], device=model.device, dtype=model.dtype),
+        )
+        chunk.video = chunk.video + video_flow * dv
+        ref = inputs['first_frame_latents']
+        chunk.video[:, :, :ref.shape[2]] = ref
+        chunk.action = model.action_scheduler.flow_step(action_flow, ta / train_a, na / train_a, chunk.action)
+        if chunk.inactive_noise is not None:
+            chunk.action[..., inactive] = chunk.inactive_noise * (na / train_a)
+        chunk.stage += 1
+
+    def actions(self, chunk):
+        actions = chunk.action.squeeze(0).float().cpu().numpy()
+        normalizer = getattr(self.model, 'normalizer', None)
+        return normalizer.unnormalize(actions) if normalizer is not None else actions
+
+    def decode(self, chunk, request):
+        frames = self.model.video_backbone.decode_video(chunk.video, tiled=request['tiled'])
+        if len(frames) != 9:
+            raise RuntimeError(f'Expected 9 decoded frames, got {len(frames)}')
+        return {chunk.start + offset: frames[offset // 4] for offset in (8, 16, 24)}
+
+    def device_context(self):
+        device = torch.device(self.model.device)
+        return torch.cuda.device(device) if device.type == 'cuda' else nullcontext()
+
+    def sync(self):
+        device = torch.device(self.model.device)
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+
+    def memory(self):
+        device = torch.device(self.model.device)
+        if device.type == 'cuda':
+            return {'allocated': torch.cuda.max_memory_allocated(device),
+                    'reserved': torch.cuda.max_memory_reserved(device)}
+        return None
+
+
+class ChunkPipeline:
+    def __init__(self, workers, speculative_steps=3):
+        if len(workers) not in (1, 4) or speculative_steps not in (2, 3):
+            raise ValueError('Chunk pipeline requires 1 or 4 workers and 2 or 3 speculative steps per interval')
+        self.workers = workers
+        self.speculative_steps = speculative_steps
+        self.executors = [ThreadPoolExecutor(max_workers=1, thread_name_prefix=f'joint-{i}')
+                          for i in range(len(workers))]
+        self.lock = Lock()
+        self.chunks = {}
+        self.pending = {}
+        self.forecasts = []
+        self.start = 0
+        self.signature = None
+
+    def _reset(self):
+        for stop, _ in self.pending.values():
+            stop.set()
+        error = None
+        try:
+            for future in [job for _, job in self.pending.values()] + self.forecasts:
+                try:
+                    future.result()
+                except Exception as exc:
+                    if error is None:
+                        error = exc
+            if error is not None:
+                raise error
+        finally:
+            self.pending.clear()
+            self.forecasts.clear()
+            self.chunks.clear()
+            self.start = 0
+            self.signature = None
+
+    def _run(self, worker, function, *args):
+        with self.workers[worker].device_context():
+            return function(*args)
+
+    def reset(self):
+        with self.lock:
+            self._reset()
+
+    def close(self):
+        with self.lock:
+            try:
+                self._reset()
+            finally:
+                for executor in self.executors:
+                    executor.shutdown(wait=True)
+
+    @torch.inference_mode()
+    def _finish(self, chunk, request):
+        worker = self.workers[chunk.worker]
+        prepared = worker.prepare(chunk, request, request['first_frame_image'])
+        while chunk.stage < 10:
+            worker.step(chunk, request, prepared)
+        actions = worker.actions(chunk)
+        worker.sync()
+        return actions
+
+    @torch.inference_mode()
+    def _forecast(self, chunk, request):
+        started = perf_counter()
+        worker = self.workers[chunk.worker]
+        frames = worker.decode(chunk, request)
+        return frames, (perf_counter() - started) * 1000
+
+    @torch.inference_mode()
+    def _advance(self, worker_index, chunks, request, forecast, stop):
+        worker = self.workers[worker_index]
+        while not stop.is_set():
+            try:
+                frames, decode_ms = forecast.result(timeout=0.001)
+                break
+            except TimeoutError:
+                if forecast.done():
+                    raise
+        else:
+            return None, None
+        started = perf_counter()
+        prepared = {}
+        # Round robin gives the one-card comparison the same stage budget and
+        # prioritizes the nearest chunk on each pass.
+        for _ in range(self.speculative_steps):
+            for chunk in chunks:
+                if stop.is_set():
+                    return decode_ms, (perf_counter() - started) * 1000
+                if chunk.stage >= 3 * self.speculative_steps:
+                    continue
+                elapsed = perf_counter()
+                if chunk.start not in prepared:
+                    prepared[chunk.start] = worker.prepare(chunk, request, [frames[chunk.start]])
+                    if stop.is_set():
+                        return decode_ms, (perf_counter() - started) * 1000
+                worker.step(chunk, request, prepared[chunk.start])
+                # Bound the outstanding work to one GPU step and timestamp the
+                # point at which this node really became available.
+                worker.sync()
+                chunk.completed_at.append(perf_counter())
+                chunk.speculative_ms += (perf_counter() - elapsed) * 1000
+        return decode_ms, (perf_counter() - started) * 1000
+
+    def generate(self, request, *, arrived=None):
+        arrived = perf_counter() if arrived is None else arrived
+        with self.lock:
+            return self._generate(request, arrived)
+
+    def _generate(self, request, arrived):
+        signature = tuple(request[key] for key in ('prompt', 'height', 'width', 'seed', 'tiled', 'shift', 'schedule'))
+        if signature != self.signature:
+            self._reset()
+            self.signature = signature
+
+        start = self.start
+        slot = (start // 8) % len(self.workers)
+        head = self.chunks.get(start, Chunk(start, slot))
+        if slot in self.pending:
+            self.pending[slot][0].set()
+        wait_started = perf_counter()
+        decode_ms = None
+        background_ms = None
+        if slot in self.pending:
+            _, future = self.pending.pop(slot)
+            decode_ms, background_ms = future.result()
+        ready_stage = sum(completed <= arrived for completed in head.completed_at)
+        online_steps = 10 - head.stage
+        wait_ms = (perf_counter() - wait_started) * 1000
+        actions = self.executors[slot].submit(self._run, slot, self._finish, head, request).result()
+        actions_ready = perf_counter()
+
+        self.chunks.pop(start, None)
+        self.start += 8
+        groups = {}
+        for offset in (8, 16, 24):
+            future_start = start + offset
+            worker = (future_start // 8) % len(self.workers)
+            chunk = self.chunks.setdefault(future_start, Chunk(future_start, worker))
+            groups.setdefault(worker, []).append(chunk)
+        # Retire completed decode tasks and surface failures even if every
+        # consumer was interrupted before the frames arrived.
+        remaining_forecasts = []
+        for previous in self.forecasts:
+            if previous.done():
+                previous.result()
+            else:
+                remaining_forecasts.append(previous)
+        forecast = self.executors[slot].submit(self._run, slot, self._forecast, head, request)
+        self.forecasts = [*remaining_forecasts, forecast]
+        for worker, chunks in groups.items():
+            previous = self.pending.get(worker)
+            if previous:
+                previous[0].set()
+            stop = Event()
+            future = self.executors[worker].submit(
+                self._run, worker, self._advance_after, previous, worker, chunks, request, forecast, stop
+            )
+            self.pending[worker] = (stop, future)
+
+        return {'video': None, 'actions': actions, 'sampler_stats': {
+            'sampler': 'chunk-pipeline', 'cold': start < 24, 'chunk_start': start,
+            'head_worker': slot, 'ready_stage_at_observation': ready_stage,
+            'online_steps': online_steps, 'background_wait_ms': wait_ms,
+            'head_speculative_ms': head.speculative_ms, 'prior_decode_ms': decode_ms,
+            'prior_worker_background_ms': background_ms,
+            'action_ready_ms': (actions_ready - arrived) * 1000,
+            'worker_peak_memory': [worker.memory() for worker in self.workers],
+        }}
+
+    def _advance_after(self, previous, worker, chunks, request, forecast, stop):
+        if previous:
+            previous[1].result()
+        if stop.is_set():
+            return None, None
+        return self._advance(worker, chunks, request, forecast, stop)

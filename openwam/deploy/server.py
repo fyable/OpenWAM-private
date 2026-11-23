@@ -43,8 +43,10 @@ Usage:
 
 import argparse
 import asyncio
+from openwam import chunk_diagnostics as diagnostics
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -187,6 +189,17 @@ class PolicyServer:
         return result
 
     def predict(self, obs: dict) -> dict:
+        if not diagnostics.ENABLED:
+            return self._predict(obs)
+        with diagnostics.context(server_episode=getattr(self, '_diagnostic_episode', 0),
+                                 action_step=self._request_count, phase='server'):
+            try:
+                with diagnostics.region('server_predict', gpu=False):
+                    return self._predict(obs)
+            finally:
+                diagnostics.flush()
+
+    def _predict(self, obs: dict) -> dict:
         """Synchronous prediction for a single observation.
 
         Args:
@@ -204,30 +217,36 @@ class PolicyServer:
         self._init_policy()
         t0 = time.monotonic()
 
-        obs = self._obs_preprocessor.preprocess(obs)
-        action = self._policy.predict_action(obs)
+        with diagnostics.region('server_observation_preprocess', gpu=False):
+            obs = self._obs_preprocessor.preprocess(obs)
+        with diagnostics.region('policy_predict', gpu=False):
+            action = self._policy.predict_action(obs)
 
         latency_ms = (time.monotonic() - t0) * 1000
         self._request_count += 1
         self._total_latency += latency_ms
 
-        return {
-            "action": action.tolist(),
-            "step": self._request_count,
-            "latency_ms": round(latency_ms, 2),
-        }
+        with diagnostics.region('server_action_convert', gpu=False):
+            return {
+                "action": action.tolist(),
+                "step": self._request_count,
+                "latency_ms": round(latency_ms, 2),
+            }
 
     def reset(self):
         """Reset policy state."""
+        self._diagnostic_episode = getattr(self, '_diagnostic_episode', 0) + 1
         if self._policy is not None:
             self._policy.reset()
         self._request_count = 0
         self._total_latency = 0.0
 
     def shutdown(self):
-        """Clean up async resources."""
+        """Clean up inference workers."""
         if self._policy is not None:
             self._policy.shutdown()
+        elif callable(shutdown_engine := getattr(self.engine, "shutdown", None)):
+            shutdown_engine()
 
     def run(self, host: str = "0.0.0.0", port: int = 8848):
         """Start the WebSocket policy server.
@@ -307,7 +326,10 @@ class PolicyServer:
                 await asyncio.Future()  # run forever
 
         logger.info("Starting PolicyServer: ws://%s:%d", host, port)
-        asyncio.run(serve())
+        try:
+            asyncio.run(serve())
+        finally:
+            self.shutdown()
 
 
 def merge_deploy_cfg(training_cfg, deploy_cfg):
@@ -356,11 +378,61 @@ def build_server_from_config(
     from openwam.deploy.model_loader import load_from_checkpoint_dir
 
     deploy_cfg = cfg if cfg is not None else OmegaConf.create({})
+    if os.environ.get('OPENWAM_CHUNK_INTEROP_THREADS'):
+        import torch
+        interop = int(os.environ['OPENWAM_CHUNK_INTEROP_THREADS'])
+        if torch.get_num_interop_threads() != interop:
+            torch.set_num_interop_threads(interop)
     _validate_inference_config(deploy_cfg)
     _normalize_compile_enabled_in_cfg(deploy_cfg)
     training_cfg, architecture = load_from_checkpoint_dir(ckpt_dir, device=device, ckpt_name=ckpt_name)
+    if os.environ.get('OPENWAM_CHUNK_INTEROP_THREADS'):
+        logging.getLogger('deploy').info('Experiment CPU budget: intraop=%s interop=%s affinity=%s',
+                                        torch.get_num_threads(), torch.get_num_interop_threads(),
+                                        sorted(os.sched_getaffinity(0)))
     merged = merge_deploy_cfg(training_cfg, deploy_cfg)
-    engine = JointInferenceEngine(cfg=merged, architecture=architecture)
+    chunk_models = None
+    if getattr(merged.inference, "sampler", "native") == "chunk-pipeline":
+        import torch
+
+        devices = getattr(merged.inference, "chunk_devices", None) or [device]
+        devices = [torch.device(value) for value in devices]
+        if any(item.type != "cuda" for item in devices):
+            raise ValueError("chunk_devices accepts only CUDA devices")
+        devices = [torch.device("cuda", item.index if item.index is not None else 0) for item in devices]
+        primary = torch.device(device)
+        if (len(devices) not in (1, 4) or len(set(devices)) != len(devices)
+                or primary.type != "cuda" or devices[0].index != (primary.index or 0)
+                or any(item.index >= torch.cuda.device_count() for item in devices)):
+            raise ValueError("chunk_devices requires one or four distinct visible CUDA devices, primary device first")
+        chunk_models = [architecture]
+        backend = getattr(merged.inference, 'chunk_worker_backend', 'thread')
+        if backend not in ('thread', 'process'):
+            raise ValueError('chunk_worker_backend must be thread or process')
+        if backend == 'process' and os.environ.get('OPENWAM_CHUNK_TRACE') == '1':
+            raise ValueError('Detailed all-thread tracing requires the thread backend')
+        try:
+            for worker_device in devices[1:]:
+                if backend == 'process':
+                    from openwam.deploy.chunk_process import ProcessChunkWorker
+                    model = ProcessChunkWorker(ckpt_dir, ckpt_name, str(worker_device),
+                                               threads=int(os.environ.get('OMP_NUM_THREADS', '1')))
+                else:
+                    with torch.cuda.device(worker_device):
+                        _, model = load_from_checkpoint_dir(ckpt_dir, device=str(worker_device), ckpt_name=ckpt_name)
+                chunk_models.append(model)
+        except BaseException:
+            for model in chunk_models[1:]:
+                if hasattr(model, 'command'):
+                    model.close(force=True)
+            raise
+    try:
+        engine = JointInferenceEngine(cfg=merged, architecture=architecture, chunk_models=chunk_models)
+    except BaseException:
+        for model in (chunk_models or [])[1:]:
+            if hasattr(model, 'command'):
+                model.close(force=True)
+        raise
     from openwam.deploy.request_trace import attach_request_trace
 
     attach_request_trace(engine)
@@ -473,10 +545,14 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--readiness-token", help=argparse.SUPPRESS)
     parser.add_argument(
         "--sampler",
-        choices=("native", "joint-paraflow", "isolated-native", "isolated-paraflow"),
+        choices=("native", "chunk-pipeline", "joint-paraflow", "isolated-native", "isolated-paraflow"),
         default=None,
         help="Experimental joint-paraflow requires H32/E8, sync mode and compile disabled.",
     )
+    parser.add_argument("--chunk-devices", type=lambda value: value.split(","), metavar="DEVICES",
+                        help="Comma-separated CUDA devices, with --device first.")
+    parser.add_argument("--chunk-speculative-steps", type=int, choices=(2, 3),
+                        help="Speculative Joint steps per interval. Defaults to 3.")
     parser.add_argument(
         "--denoise-steps",
         type=int,
@@ -602,6 +678,9 @@ def _apply_inference_overrides(cfg, args):
 
     if getattr(args, "sampler", None) is not None:
         OmegaConf.update(cfg, "inference.sampler", args.sampler, merge=False)
+    for key in ("chunk_devices", "chunk_speculative_steps"):
+        if getattr(args, key, None) is not None:
+            OmegaConf.update(cfg, f"inference.{key}", getattr(args, key), merge=False)
     if args.denoise_steps is not None:
         OmegaConf.update(cfg, "inference.denoise_steps", args.denoise_steps, merge=False)
     if args.denoise_mode is not None:

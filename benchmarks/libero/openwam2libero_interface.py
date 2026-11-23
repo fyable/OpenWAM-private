@@ -13,7 +13,9 @@ server is achieved EEF10, matching the canonical training reader.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from time import perf_counter
 from typing import Iterable
 
 import numpy as np
@@ -148,6 +150,7 @@ class OpenWAMLiberoPolicy:
             raise RuntimeError(f"OpenWAM server reset returned unexpected response: {ack}")
 
     def act(self, obs: dict, prompt: str) -> np.ndarray:
+        started = perf_counter()
         payload = build_payload(
             head=encode_numpy_b64(resize_for_lshape_slot(self._image(obs, self._head_camera_key), "head_camera")),
             left_wrist=self._maybe_encode(obs, self._left_wrist_camera_key, "left_wrist_camera"),
@@ -155,7 +158,9 @@ class OpenWAMLiberoPolicy:
             prompt=prompt,
             state=self._state(obs),
         )
+        payload_ready = perf_counter()
         response = self._client.predict(payload)
+        response_ready = perf_counter()
         model_action = np.asarray(response["action"], dtype=np.float32).reshape(-1)
         if self._action_indices is not None:
             model_action = model_action[self._action_indices]
@@ -168,6 +173,26 @@ class OpenWAMLiberoPolicy:
         if self._action_clip is not None:
             action = np.clip(action, -float(self._action_clip), float(self._action_clip))
         self._maybe_debug(obs, payload, model_action, action)
+        if os.environ.get('OPENWAM_CHUNK_DIAGNOSTICS') == '1':
+            print('[CHUNK_CLIENT] ' + json.dumps({
+                'episode': self._episode, 'step': self._step,
+                'begin_s': started, 'payload_ready_s': payload_ready,
+                'response_ready_s': response_ready, 'end_s': perf_counter(),
+            }), flush=True)
+        if os.environ.get("OPENWAM_LIBERO_REQUEST_TIMING") == "1":
+            print("[CLIENT_TIMING] " + json.dumps({
+                "episode": self._episode, "step": self._step,
+                "observation_to_action_ms": (perf_counter() - started) * 1000,
+            }), flush=True)
+        if os.environ.get("OPENWAM_BENCH_TIMING") == "1":
+            print("[BENCH_REQUEST] " + json.dumps({
+                "episode": self._episode, "step": self._step,
+                "kind": "inference" if self._step % 8 == 0 else "cached",
+                "phase": "first" if self._step == 0 else ("warmup" if self._step < 24 else "steady"),
+                "client_ms": (perf_counter() - started) * 1000,
+                "transport_ms": (response_ready - payload_ready) * 1000,
+                "server_ms": response.get("latency_ms"),
+            }), flush=True)
         self._step += 1
         return action
 

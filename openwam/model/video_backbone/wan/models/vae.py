@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1017,7 +1018,7 @@ class WanVideoVAE(nn.Module):
                 h_, w_ = h + size_h, w + size_w
                 tasks.append((h, h_, w, w_))
 
-        data_device = "cpu"
+        data_device = device if os.environ.get('OPENWAM_CHUNK_VAE_GPU_ACCUM') == '1' else "cpu"
         computation_device = device
 
         out_T = T * 4 - 3
@@ -1034,7 +1035,7 @@ class WanVideoVAE(nn.Module):
 
         for h, h_, w, w_ in tqdm(tasks, desc="VAE decoding"):
             hidden_states_batch = hidden_states[:, :, :, h:h_, w:w_].to(computation_device)
-            hidden_states_batch = self.model.decode(hidden_states_batch, self.scale).to(data_device)
+            hidden_states_batch = self._decode_model(hidden_states_batch).to(data_device)
 
             mask = self.build_mask(
                 hidden_states_batch,
@@ -1158,8 +1159,20 @@ class WanVideoVAE(nn.Module):
 
     def single_decode(self, hidden_state, device):
         hidden_state = hidden_state.to(device)
-        video = self.model.decode(hidden_state, self.scale)
+        video = self._decode_model(hidden_state)
         return video.clamp_(-1, 1)
+
+    def _decode_model(self, hidden_state):
+        if os.environ.get('OPENWAM_CHUNK_VAE_GRAPH') != '1':
+            return self.model.decode(hidden_state, self.scale)
+        from openwam.deploy.chunk_vae_graph import DecodeGraph
+        key = (tuple(hidden_state.shape), hidden_state.dtype, hidden_state.device)
+        graph = getattr(self, '_chunk_decode_graph', None)
+        if graph is None or graph.key != key:
+            self._chunk_decode_graph = None
+            graph = DecodeGraph(self.model, hidden_state, self.scale)
+            self._chunk_decode_graph = graph
+        return graph.replay(hidden_state)
 
     def encode(self, videos, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
         videos = [video.to("cpu") for video in videos]
@@ -1178,7 +1191,8 @@ class WanVideoVAE(nn.Module):
         return hidden_states
 
     def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        hidden_states = [hidden_state.to("cpu") for hidden_state in hidden_states]
+        storage = device if os.environ.get('OPENWAM_CHUNK_VAE_GPU_ACCUM') == '1' else 'cpu'
+        hidden_states = [hidden_state.to(storage) for hidden_state in hidden_states]
         videos = []
         for hidden_state in hidden_states:
             hidden_state = hidden_state.unsqueeze(0)

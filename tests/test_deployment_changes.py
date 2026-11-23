@@ -154,6 +154,8 @@ class TestDeployConfigLoading:
             "port",
             "denoise_steps",
             "sampler",
+            "chunk_devices",
+            "chunk_speculative_steps",
             "denoise_mode",
             "lead_modality",
             "variance_shift_alpha",
@@ -192,6 +194,17 @@ class TestDeployConfigLoading:
 
         cfg = deploy._apply_inference_overrides(cfg, args)
         assert OmegaConf.select(cfg, "inference.denoise_steps") == 20
+
+    def test_cli_chunk_pipeline_overrides(self):
+        deploy = self._policy_server()
+        args = self._blank_args()
+        args.sampler = "chunk-pipeline"
+        args.chunk_devices = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
+        args.chunk_speculative_steps = 3
+        cfg = deploy._apply_inference_overrides(deploy._load_deploy_yaml(), args)
+        assert cfg.inference.sampler == "chunk-pipeline"
+        assert list(cfg.inference.chunk_devices) == args.chunk_devices
+        assert cfg.inference.chunk_speculative_steps == 3
 
     def test_cli_schedule_overrides(self):
         from omegaconf import OmegaConf

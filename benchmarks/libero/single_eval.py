@@ -7,9 +7,11 @@ It imports the canonical native-action policy adapter in this directory.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
+from time import perf_counter
 from pathlib import Path
 
 import numpy as np
@@ -206,6 +208,10 @@ def run_eval(cfg: dict) -> int:
     progress_file = Path(cfg["progress_file"]) if cfg.get("progress_file") else None
     try:
         for offset, trial in enumerate(range(trial_start, trial_stop)):
+            episode_started = perf_counter()
+            rollout_started = episode_started
+            policy_sum_ms = 0.0
+            env_sum_ms = 0.0
             entry = None if manifest_entries is None else manifest_entries[offset]
             domain = (
                 None
@@ -219,6 +225,10 @@ def run_eval(cfg: dict) -> int:
             if manifest is None and reseed_each_trial:
                 env.seed(seed + trial)
             result = {"trial": trial, "success": False, "policy_steps": 0}
+            if len(init_states) > 0 and os.environ.get('OPENWAM_LIBERO_STATE_HASH') == '1':
+                initial = np.ascontiguousarray(init_states[trial % len(init_states)])
+                result['init_state_sha256'] = hashlib.sha256(
+                    str((initial.dtype.str, initial.shape)).encode() + initial.tobytes()).hexdigest()
             if entry is not None:
                 result["init_state_index"] = entry["init_state_index"]
             try:
@@ -240,14 +250,43 @@ def run_eval(cfg: dict) -> int:
                         with domain.activate():
                             obs, _, _, _ = env.step(settle_action)
                 policy.reset()
+                rollout_started = perf_counter()
                 done = False
+                diagnostic_timing = os.environ.get('OPENWAM_CHUNK_DIAGNOSTICS') == '1'
+                chunk_env_ms = 0.0
+                execution_window_start = None
                 for step in range(max_steps):
+                    policy_started = perf_counter()
+                    if diagnostic_timing and step % 8 == 0 and execution_window_start is not None:
+                        print('[CHUNK_ENV] ' + json.dumps({
+                            'trial': trial, 'step': step, 'kind': 'execution_window',
+                            'begin_s': execution_window_start, 'end_s': policy_started,
+                            'window_ms': (policy_started - execution_window_start) * 1000,
+                            'env_sum_ms': chunk_env_ms,
+                        }), flush=True)
+                        chunk_env_ms = 0.0
                     action = policy.act(obs, task.language)
+                    policy_finished = perf_counter()
+                    if step % 8 == 0:
+                        execution_window_start = policy_finished
+                    env_started = perf_counter()
                     if domain is None:
                         obs, reward, done, _ = env.step(action)
                     else:
                         with domain.activate():
                             obs, reward, done, _ = env.step(action)
+                    env_finished = perf_counter()
+                    policy_sum_ms += (policy_finished - policy_started) * 1000
+                    env_sum_ms += (env_finished - env_started) * 1000
+                    chunk_env_ms += (env_finished - env_started) * 1000
+                    if diagnostic_timing:
+                        print('[CHUNK_ENV] ' + json.dumps({
+                            'trial': trial, 'step': step, 'kind': 'step',
+                            'policy_begin_s': policy_started, 'policy_end_s': policy_finished,
+                            'env_begin_s': env_started, 'env_end_s': env_finished,
+                            'env_ms': (env_finished - env_started) * 1000,
+                            'policy_ms': (policy_finished - policy_started) * 1000,
+                        }), flush=True)
                     result["policy_steps"] = step + 1
                     result["last_reward"] = float(reward)
                     if done:
@@ -255,6 +294,10 @@ def run_eval(cfg: dict) -> int:
                         result["success"] = True
                         break
             finally:
+                if os.environ.get("OPENWAM_BENCH_TIMING") == "1":
+                    result.update(episode_ms=(perf_counter() - episode_started) * 1000,
+                                  rollout_ms=(perf_counter() - rollout_started) * 1000,
+                                  policy_ms=policy_sum_ms, env_ms=env_sum_ms)
                 trial_results.append(result)
             details = f"trial={trial} success={result['success']} steps={result['policy_steps']}"
             if entry is not None:

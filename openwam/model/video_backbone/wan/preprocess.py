@@ -13,11 +13,16 @@ import torch
 from einops import reduce, repeat
 from PIL import Image
 
+from openwam.chunk_diagnostics import context, profiled, region
 
+
+@profiled('image_preprocess')
 def preprocess_image(image, *, dtype, device, pattern="B C H W", min_value=-1, max_value=1):
     """PIL.Image -> tensor in ``[min_value, max_value]`` on ``(dtype, device)``."""
-    image = torch.Tensor(np.array(image, dtype=np.float32))
-    image = image.to(dtype=dtype, device=device)
+    with region('image_numpy_tensor', gpu=False):
+        image = torch.Tensor(np.array(image, dtype=np.float32))
+    with region('image_h2d_call'):
+        image = image.to(dtype=dtype, device=device)
     image = image * ((max_value - min_value) / 255) + min_value
     image = repeat(image, f"H W C -> {pattern}", **({"B": 1} if "B" in pattern else {}))
     return image
@@ -32,12 +37,16 @@ def preprocess_video(video, *, dtype, device, pattern="B C T H W", min_value=-1,
     return video
 
 
+@profiled('decoded_frame')
 def _vae_output_to_image(vae_output, pattern="B C H W", min_value=-1, max_value=1):
     if pattern != "H W C":
         vae_output = reduce(vae_output, f"{pattern} -> H W C", reduction="mean")
-    image = ((vae_output - min_value) * (255 / (max_value - min_value))).clip(0, 255)
-    image = image.to(device="cpu", dtype=torch.uint8)
-    image = Image.fromarray(image.numpy())
+    with region('pixel_scale_clamp'):
+        image = ((vae_output - min_value) * (255 / (max_value - min_value))).clip(0, 255)
+    with region('frame_d2h_cast_call'):
+        image = image.to(device="cpu", dtype=torch.uint8)
+    with region('frame_numpy_pil', gpu=False):
+        image = Image.fromarray(image.numpy())
     return image
 
 
@@ -45,9 +54,11 @@ def vae_output_to_video(vae_output, pattern="B C T H W", min_value=-1, max_value
     """VAE pixel tensor -> list[PIL.Image]."""
     if pattern != "T H W C":
         vae_output = reduce(vae_output, f"{pattern} -> T H W C", reduction="mean")
-    return [
-        _vae_output_to_image(image, pattern="H W C", min_value=min_value, max_value=max_value) for image in vae_output
-    ]
+    frames = []
+    for frame_index, image in enumerate(vae_output):
+        with context(frame_index=frame_index, selected_for_future=frame_index in (2, 4, 6)):
+            frames.append(_vae_output_to_image(image, pattern="H W C", min_value=min_value, max_value=max_value))
+    return frames
 
 
 def check_resize_height_width(
@@ -81,8 +92,11 @@ def check_resize_height_width(
     return height, width, num_frames
 
 
+@profiled('noise_total')
 def generate_noise(shape, *, dtype, device, seed=None, rand_device="cpu", rand_torch_dtype=torch.float32):
     """Seeded Gaussian noise built on ``rand_device`` then moved to ``(dtype, device)``."""
     generator = None if seed is None else torch.Generator(rand_device).manual_seed(seed)
-    noise = torch.randn(shape, generator=generator, device=rand_device, dtype=rand_torch_dtype)
-    return noise.to(dtype=dtype, device=device)
+    with region('noise_generate', gpu=rand_device != 'cpu'):
+        noise = torch.randn(shape, generator=generator, device=rand_device, dtype=rand_torch_dtype)
+    with region('noise_h2d_call'):
+        return noise.to(dtype=dtype, device=device)

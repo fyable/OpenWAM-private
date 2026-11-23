@@ -213,6 +213,15 @@ def load_from_checkpoint_dir(
 
     architecture.set_dtype_device(model_dtype, torch.device(device))
     architecture.eval()
+    model_tensors = list(architecture.named_parameters()) + list(architecture.named_buffers())
+    logger.info("Loaded model tensor devices: %s", sorted({str(tensor.device) for _, tensor in model_tensors}))
+    if os.environ.get("OPENWAM_REQUIRE_GPU_RESIDENT") == "1":
+        expected_device = torch.device(architecture.device)
+        misplaced = [name for name, tensor in model_tensors
+                     if tensor.device != expected_device]
+        if expected_device.type != "cuda" or misplaced:
+            raise RuntimeError(f"GPU-resident inference required on {expected_device}; misplaced tensors: {misplaced}")
+        logger.info("GPU residency verified: all model parameters and buffers on %s; no CPU offload", expected_device)
 
     # 6. Attach the action normalizer built from saved normalization_stats.npy + config.
     architecture.attach_normalizer(_build_normalizer(cfg, ckpt_dir))
