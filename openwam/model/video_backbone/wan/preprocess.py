@@ -28,10 +28,11 @@ def preprocess_image(image, *, dtype, device, pattern="B C H W", min_value=-1, m
     return image
 
 
-def preprocess_video(video, *, dtype, device, pattern="B C T H W", min_value=-1, max_value=1):
+def preprocess_video(video, *, dtype, device, pattern="B C T H W", min_value=-1, max_value=1, pin_memory=False):
     """List[PIL.Image] -> stacked tensor along the ``T`` axis of ``pattern``."""
     video = [
-        preprocess_image(image, dtype=dtype, device=device, min_value=min_value, max_value=max_value) for image in video
+        preprocess_image(image, dtype=dtype, device=device, min_value=min_value, max_value=max_value,
+                         pin_memory=pin_memory) for image in video
     ]
     video = torch.stack(video, dim=pattern.index("T") // 2)
     return video

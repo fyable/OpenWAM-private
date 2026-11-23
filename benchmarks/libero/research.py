@@ -130,6 +130,7 @@ def model_identity(server, args):
     driver = architecture._mot_driver or architecture.build_mot_driver()
     assets = assets_identity(args)
     return seal({**source_identity(), "assets": assets, "torch_device": str(architecture.device),
+                 "memory_mode": getattr(architecture, "research_memory_mode", "resident"),
                  "dtype": str(architecture.dtype), "architecture": type(architecture).__name__,
                  "num_layers": driver.num_layers, "num_heads": driver.num_heads, "head_dim": driver.head_dim,
                  "attention_mask_mode": driver.attention_mask_mode,
@@ -382,6 +383,8 @@ def main():
             sub.add_argument("--selection", required=True)
             sub.add_argument("--selected-split", choices=("discovery", "calibration"), required=True)
         if name == "collect":
+            sub.add_argument("--task-shard-index", type=int, default=0)
+            sub.add_argument("--task-shard-count", type=int, default=1)
             sub.add_argument("--policy-config", default="benchmarks/libero/policy_config.yml")
             sub.add_argument("--selected-split", choices=("discovery", "calibration"), required=True)
             sub.add_argument("--episodes", type=int, default=10)
@@ -391,6 +394,8 @@ def main():
     summary.add_argument("--features")
     summary.add_argument("--calibration")
     args = parser.parse_args()
+    if args.command == "collect" and not 0 <= args.task_shard_index < args.task_shard_count:
+        parser.error("Invalid collection task shard")
     if hasattr(args, "steps") and args.steps < 1:
         parser.error("--steps must be positive")
     if hasattr(args, "horizon") and args.horizon is not None and args.horizon < 1:

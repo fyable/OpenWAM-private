@@ -211,7 +211,15 @@ def load_from_checkpoint_dir(
     model_dtype = _DTYPE_MAP.get(str(_mp).strip().lower(), torch.bfloat16)
     logger.info("Loading all models with dtype=%s (mixed_precision=%s)", model_dtype, _mp)
 
-    architecture.set_dtype_device(model_dtype, torch.device(device))
+    memory_mode = os.environ.get("E2_MEMORY_MODE", "resident")
+    if memory_mode not in {"resident", "text-offload"}:
+        raise ValueError(f"Unsupported E2_MEMORY_MODE: {memory_mode}")
+    if memory_mode == "text-offload":
+        from openwam.deploy.research_offload import configure_text_offload
+        configure_text_offload(architecture, model_dtype, torch.device(device))
+    else:
+        architecture.set_dtype_device(model_dtype, torch.device(device))
+    architecture.research_memory_mode = memory_mode
     architecture.eval()
     model_tensors = list(architecture.named_parameters()) + list(architecture.named_buffers())
     logger.info("Loaded model tensor devices: %s", sorted({str(tensor.device) for _, tensor in model_tensors}))

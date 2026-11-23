@@ -1050,6 +1050,7 @@ class WanBase(VideoBackbone):
             vae=self.vae,
             dtype=self.dtype,
             device=self.device,
+            pin_memory=kw.get("pin_first_frame", False),
         )
         return inputs_shared
 

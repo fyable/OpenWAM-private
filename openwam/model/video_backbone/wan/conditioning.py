@@ -112,7 +112,9 @@ def finalize_ti2v_first_frame_latents(inputs_shared: dict, first_frame_image, *,
     inputs_shared["fuse_vae_embedding_in_latents"] = True
     inputs_shared["num_clean_prefix_frames"] = 0
     ref_frames = first_frame_image if isinstance(first_frame_image, list) else [first_frame_image]
-    ref_tensor = wan_encode.preprocess_video(ref_frames, encoder=encoder, dtype=dtype, device=device)
+    ref_tensor = wan_encode.preprocess_video(
+        ref_frames, encoder=encoder, dtype=dtype, device=device, pin_memory=pin_memory
+    )
     ref_image_latents = wan_encode.encode_video(ref_tensor.to(device), vae=vae, encoder=encoder).to(
         dtype=dtype, device=device
     )

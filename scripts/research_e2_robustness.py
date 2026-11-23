@@ -149,6 +149,9 @@ def prepare(args):
                  "hours": args.hours, "gpu_uuid": os.environ.get("CUDA_VISIBLE_DEVICES"),
                  "split_file": str(args.split.resolve()),
                  "checkpoint_dir": str(args.ckpt_dir.resolve()), "checkpoint_name": args.ckpt_name})
+    if getattr(args, "parallel_gpus", None):
+        spec = seal({**{key: value for key, value in spec.items() if key != "sha256"},
+                     "execution_mode": "independent_state_shards_v1", "gpu_uuids": args.parallel_gpus})
     path = args.run / "plan.json"
     if path.exists():
         if read_sealed(path) != spec:
@@ -167,11 +170,22 @@ def due(start, hours, now=None):
     return (time.monotonic() if now is None else now) - start >= hours * 3600
 
 
+def owns_state(subset_index, state_index, shard_index=0, shard_count=1):
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("Invalid robustness shard index/count")
+    return (subset_index * 24 + state_index) % shard_count == shard_index
+
+
 def run_study(args, spec, started):
     from benchmarks.libero.research import build_server, execution_horizon, load_states, model_identity, validate_t0
     from openwam.research.exploratory import validate_bank_identity
     from openwam.research.interventions import Intervention, ResearchContext
     from openwam.research.runner import compare_contexts, infrastructure_retries, paired_generate, run_pair, run_t0
+
+    if spec.get("execution_mode") == "independent_state_shards_v1":
+        if (args.shard_count != len(spec["gpu_uuids"])
+            or os.environ.get("CUDA_VISIBLE_DEVICES") != spec["gpu_uuids"][args.shard_index]):
+            raise ValueError("Worker GPU/shard assignment differs from the frozen parallel plan")
 
     base = Path(spec["base"])
     split = read_sealed(spec["split_file"])
@@ -232,10 +246,14 @@ def run_study(args, spec, started):
         print(f"Fresh checks passed: {subset}, horizon={horizon}", flush=True)
     atomic_json(args.run / "noise_floor.json", seal({"plan_sha256": spec["sha256"], "rows": floors}))
     completed, measured, elapsed_pairs = 0, 0, 0.0
-    total = len(spec["methods"]) * 48
+    shard_index, shard_count = getattr(args, "shard_index", 0), getattr(args, "shard_count", 1)
+    total = len(spec["methods"]) * sum(owns_state(subset_index, state_index, shard_index, shard_count)
+              for subset_index in range(2) for state_index in range(24))
     for stage in ("A", "B"):
-        for subset in SUBSETS:
-            for entry, conditions in states_by_split[subset]:
+        for subset_index, subset in enumerate(SUBSETS):
+            for state_index, (entry, conditions) in enumerate(states_by_split[subset]):
+                if not owns_state(subset_index, state_index, shard_index, shard_count):
+                    continue
                 for method in (value for value in spec["methods"] if value["stage"] == stage):
                     path = pair_path(args.run, subset, entry["state_id"], method["method_id"])
                     if path.exists():

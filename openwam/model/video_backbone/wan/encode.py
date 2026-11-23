@@ -54,10 +54,15 @@ def encode_text_for_inference(
     return context, seq_lens
 
 
-def preprocess_video(frames, *, encoder=None, dtype, device) -> Tensor:
+def preprocess_video(frames, *, encoder=None, dtype, device, pin_memory=False) -> Tensor:
     if encoder is not None:
+        if pin_memory:
+            from openwam.model.video_backbone.encoder.wan22_vae import WanVideoVAEEncoder
+
+            if isinstance(encoder, WanVideoVAEEncoder):
+                return encoder.preprocess_video(frames, pin_memory=True)
         return encoder.preprocess_video(frames)
-    return _preprocess_video_native(frames, dtype=dtype, device=device)
+    return _preprocess_video_native(frames, dtype=dtype, device=device, pin_memory=pin_memory)
 
 
 @profiled('vae_encode')
